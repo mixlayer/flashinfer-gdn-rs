@@ -1,0 +1,8 @@
+/target/
+
+# Local compiler and kernel caches must never be committed.
+/.cutedsl-jit-cache/
+
+# Python bytecode is never a source input or packaged artifact.
+__pycache__/
+*.py[cod]

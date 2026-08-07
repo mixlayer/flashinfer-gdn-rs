@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "kernel": "gdn_decode_pretranspose",
+  "symbol": "flashinfer_gdn_decode_pretranspose_f32_state",
+  "gpu_arch": "sm_121a",
+  "io_dtype": "bfloat16",
+  "dt_bias_dtype": "float32",
+  "h": 16,
+  "hv": 16,
+  "k": 128,
+  "v": 128,
+  "t": 1,
+  "scale": 0.08838834764831845,
+  "use_qk_l2norm": true,
+  "use_pool_indexing": false
+}

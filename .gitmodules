@@ -1,0 +1,3 @@
+[submodule "crates/flashinfer-gdn-sys/vendor/flashinfer"]
+	path = crates/flashinfer-gdn-sys/vendor/flashinfer
+	url = https://github.com/flashinfer-ai/flashinfer.git
