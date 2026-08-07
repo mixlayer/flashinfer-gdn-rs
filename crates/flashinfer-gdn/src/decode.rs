@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
 use flashinfer_gdn_sys::{
-    DlDevice, DlDeviceType, DlTensor, DtBiasDType, InputDType, PretransposeDecodeCompiler,
-    PretransposeDecodeKernel, PretransposeDecodeSpecialization, PretransposeDecodeTensors,
+    DtBiasDType, InputDType, PretransposeDecodeCompiler, PretransposeDecodeKernel,
+    PretransposeDecodeSpecialization, PretransposeDecodeTensors,
 };
 
+use crate::tensor::DlTensorOwner;
 use crate::{CudaStream, CudaTensor, DType, Error, Result};
 
 /// Tensor arguments for one pretransposed float-state decode launch.
@@ -316,11 +317,11 @@ fn validate_pretranspose_decode_for_device(
     Ok(())
 }
 
-fn bounds_overlap(left: (usize, usize), right: (usize, usize)) -> bool {
+pub(crate) fn bounds_overlap(left: (usize, usize), right: (usize, usize)) -> bool {
     left.0 < right.1 && right.0 < left.1
 }
 
-fn check_rank(tensor: &CudaTensor, name: &'static str, rank: usize) -> Result<()> {
+pub(crate) fn check_rank(tensor: &CudaTensor, name: &'static str, rank: usize) -> Result<()> {
     if tensor.shape().len() != rank {
         return Err(Error::tensor(
             name,
@@ -330,7 +331,7 @@ fn check_rank(tensor: &CudaTensor, name: &'static str, rank: usize) -> Result<()
     Ok(())
 }
 
-fn expect(
+pub(crate) fn expect(
     tensor: &CudaTensor,
     name: &'static str,
     dtype: DType,
@@ -370,7 +371,7 @@ fn expect(
     Ok(())
 }
 
-fn checked_mul(left: i64, right: i64, label: &'static str) -> Result<i64> {
+pub(crate) fn checked_mul(left: i64, right: i64, label: &'static str) -> Result<i64> {
     left.checked_mul(right)
         .ok_or_else(|| Error::tensor("state", format!("{label} overflows i64")))
 }
@@ -384,38 +385,6 @@ fn compact_strides(shape: &[i64]) -> Result<Vec<i64>> {
         stride = checked_mul(stride, *dimension, "compact stride")?;
     }
     Ok(strides)
-}
-
-struct DlTensorOwner<'a> {
-    tensor: DlTensor,
-    _source: std::marker::PhantomData<&'a CudaTensor>,
-}
-
-impl<'a> DlTensorOwner<'a> {
-    fn from_tensor(source: &'a CudaTensor) -> Result<Self> {
-        let ndim = i32::try_from(source.shape().len()).map_err(|_| {
-            Error::tensor(
-                "descriptor",
-                format!("tensor rank exceeds i32: {}", source.shape().len()),
-            )
-        })?;
-        let tensor = DlTensor {
-            data: source.data(),
-            device: DlDevice {
-                device_type: DlDeviceType::Cuda,
-                device_id: source.device_id(),
-            },
-            ndim,
-            dtype: source.dtype().dlpack(),
-            shape: source.shape().as_ptr().cast_mut(),
-            strides: source.strides().as_ptr().cast_mut(),
-            byte_offset: source.byte_offset(),
-        };
-        Ok(Self {
-            tensor,
-            _source: std::marker::PhantomData,
-        })
-    }
 }
 
 #[cfg(test)]

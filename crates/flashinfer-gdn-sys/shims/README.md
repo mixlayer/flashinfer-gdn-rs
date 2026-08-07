@@ -5,10 +5,13 @@ from the Cargo-provided source tree, construct specialization inputs, compile wi
 `--enable-tvm-ffi`, and export a loadable AOT artifact. They do not install
 FlashInfer or assume it is present in site-packages.
 
-The first request is a direct-state pretransposed decode specialization for SM121a.
-Its compiler parses the exact upstream file and emits an auditable, Torch-free
-kernel projection into the artifact before invoking CuTeDSL. This source adapter is
-specific to the pinned FlashInfer revision.
+The implemented requests cover pretransposed and non-transposed float-state decode.
+Each compiler parses the exact upstream file and emits an auditable, Torch-free
+kernel projection into the artifact before invoking CuTeDSL. The non-transposed
+request also records whether FlashInfer's small- or large-batch implementation is
+compiled and applies a checked launch-grid adaptation so a dynamic persistent state
+pool can be indexed without a gather. These source adapters are specific to the
+pinned FlashInfer revision.
 
 From the workspace root, prepare the current Linux aarch64/Python 3.12/CUDA 13
 environment with:

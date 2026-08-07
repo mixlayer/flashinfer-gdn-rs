@@ -2,9 +2,9 @@
 //! Candle CUDA integration for FlashInfer GDN kernels.
 //!
 //! Preparation performs all compilation, loading, and auxiliary allocation before
-//! CUDA Graph capture. Eager execution and capture use the same
-//! [`PretransposeDecodePlan::forward`] method; graph owners are responsible for
-//! their normal warmup, fixed-address, and replay lifecycle.
+//! CUDA Graph capture. Eager execution and capture use each plan's `forward`
+//! method; graph owners are responsible for their normal warmup, fixed-address,
+//! and replay lifecycle.
 
 use std::ffi::c_void;
 
@@ -15,9 +15,14 @@ use candle::cuda_backend::{CudaDevice, CudaStorage, CudaStorageSlice};
 use candle::{DType as CandleDType, Layout, Result, Storage, Tensor};
 use flashinfer_gdn::{CudaTensor, DType};
 
+mod nontranspose_decode;
 mod pretranspose_decode;
 
-pub use flashinfer_gdn::{DtBiasDType, InputDType, PretransposeDecodeCompiler};
+pub use flashinfer_gdn::{
+    DtBiasDType, InputDType, NontransposeDecodeBatchClass, NontransposeDecodeCompiler,
+    PretransposeDecodeCompiler,
+};
+pub use nontranspose_decode::{NontransposeDecodeInputs, NontransposeDecodePlan};
 pub use pretranspose_decode::{PretransposeDecodeInputs, PretransposeDecodePlan};
 
 #[derive(Debug, Clone)]

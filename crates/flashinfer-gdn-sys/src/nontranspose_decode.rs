@@ -1,14 +1,5 @@
-#![deny(unsafe_op_in_unsafe_fn)]
-//! Raw FlashInfer GDN specialization and entrypoint integration.
-//!
-//! This crate owns the versioned CuTeDSL shims and the unsafe boundary between
-//! GDN-specific argument schemas and `cutedsl-jit` modules. It intentionally does
-//! not depend on Candle.
-
 use std::ffi::c_void;
-use std::fs::{self, File};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,53 +9,48 @@ use cutedsl_jit::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-mod nontranspose_decode;
-
-pub use nontranspose_decode::{
-    NontransposeDecodeBatchClass, NontransposeDecodeCompiler, NontransposeDecodeKernel,
-    NontransposeDecodeSpecialization, NontransposeDecodeTensors,
+use super::{
+    DlTensor, DtBiasDType, InputDType, absolute_path, host_compiler_identity, read_json,
+    source_root, valid_gpu_architecture, write_json,
 };
 
-/// Error type shared with the generic artifact runtime.
-pub use cutedsl_jit::Error as JitError;
-/// Official DLPack/TVM FFI raw layouts used by the typed sys entrypoint.
-pub use cutedsl_jit::{DlDataType, DlDataTypeCode, DlDevice, DlDeviceType, DlTensor};
+/// FlashInfer's execution-class boundary for non-transposed decode.
+pub const SMALL_BATCH_THRESHOLD: usize = 32;
 
-/// FlashInfer release whose GDN source and shim contracts this crate targets.
-pub const FLASHINFER_VERSION: &str = env!("FLASHINFER_GDN_VERSION");
-
-/// Git revision corresponding to [`FLASHINFER_VERSION`].
-pub const FLASHINFER_GIT_REV: &str = env!("FLASHINFER_GDN_GIT_REV");
-
-/// Returns the FlashInfer source tree selected by this crate's build script.
-#[must_use]
-pub fn source_root() -> &'static Path {
-    Path::new(env!("FLASHINFER_GDN_SOURCE_ROOT"))
-}
-
-/// Input element type compiled into a decode specialization.
+/// Compile-time kernel selected by FlashInfer for a decode batch size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum InputDType {
-    /// IEEE float16.
-    Float16,
-    /// Brain float16.
-    Bfloat16,
+pub enum NontransposeDecodeBatchClass {
+    /// Eight 128-thread blocks per state/head, used for batches below 32.
+    Small,
+    /// One 256-thread block per state/head, used for batches of 32 or more.
+    Large,
 }
 
-/// `dt_bias` element type compiled into a decode specialization.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum DtBiasDType {
-    /// Brain float16.
-    Bfloat16,
-    /// IEEE float32.
-    Float32,
+impl NontransposeDecodeBatchClass {
+    /// Returns the upstream kernel class for `batch`.
+    #[must_use]
+    pub const fn for_batch(batch: usize) -> Self {
+        if batch < SMALL_BATCH_THRESHOLD {
+            Self::Small
+        } else {
+            Self::Large
+        }
+    }
+
+    /// Whether this class is the one selected by upstream for `batch`.
+    #[must_use]
+    pub const fn matches(self, batch: usize) -> bool {
+        matches!(
+            (self, batch < SMALL_BATCH_THRESHOLD),
+            (Self::Small, true) | (Self::Large, false)
+        )
+    }
 }
 
-/// Complete compile-time request for the float-state pretransposed decode kernel.
+/// Complete compile-time request for float-state non-transposed decode.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PretransposeDecodeSpecialization {
+pub struct NontransposeDecodeSpecialization {
     /// Request schema version.
     pub schema_version: u32,
     /// Versioned kernel family name.
@@ -85,29 +71,35 @@ pub struct PretransposeDecodeSpecialization {
     pub k: usize,
     /// Value dimension.
     pub v: usize,
-    /// Tokens per call; pretransposed decode requires one.
+    /// Tokens per call; decode requires one.
     pub t: usize,
     /// Query scale.
     pub scale: f32,
     /// Whether Q/K L2 normalization is fused into the kernel.
     pub use_qk_l2norm: bool,
-    /// Whether state is selected through read/write pool indices.
-    pub use_pool_indexing: bool,
+    /// Small- or large-batch upstream implementation.
+    pub batch_class: NontransposeDecodeBatchClass,
 }
 
-impl PretransposeDecodeSpecialization {
-    /// Creates the standard BF16-input, float-state specialization.
+impl NontransposeDecodeSpecialization {
+    /// Creates the standard BF16-input, float-state specialization for `batch`.
     pub fn new(
         gpu_arch: impl Into<String>,
         h: usize,
         hv: usize,
         k: usize,
         v: usize,
+        batch: usize,
     ) -> Result<Self> {
+        if batch == 0 {
+            return Err(Error::InvalidInput(
+                "non-transposed decode batch size must be positive".into(),
+            ));
+        }
         let specialization = Self {
             schema_version: 1,
-            kernel: "gdn_decode_pretranspose".into(),
-            symbol: "flashinfer_gdn_decode_pretranspose_f32_state".into(),
+            kernel: "gdn_decode_nontranspose".into(),
+            symbol: "flashinfer_gdn_decode_nontranspose_f32_state".into(),
             gpu_arch: gpu_arch.into(),
             io_dtype: InputDType::Bfloat16,
             dt_bias_dtype: DtBiasDType::Float32,
@@ -118,17 +110,10 @@ impl PretransposeDecodeSpecialization {
             t: 1,
             scale: (k as f32).sqrt().recip(),
             use_qk_l2norm: true,
-            use_pool_indexing: false,
+            batch_class: NontransposeDecodeBatchClass::for_batch(batch),
         };
         specialization.validate()?;
         Ok(specialization)
-    }
-
-    /// Selects direct-state or indexed state-pool code generation.
-    #[must_use]
-    pub fn pool_indexing(mut self, enabled: bool) -> Self {
-        self.use_pool_indexing = enabled;
-        self
     }
 
     /// Selects the Q/K/V/gate input type.
@@ -162,11 +147,11 @@ impl PretransposeDecodeSpecialization {
     /// Validates constraints imposed by the pinned upstream kernel.
     pub fn validate(&self) -> Result<()> {
         if self.schema_version != 1
-            || self.kernel != "gdn_decode_pretranspose"
-            || self.symbol != "flashinfer_gdn_decode_pretranspose_f32_state"
+            || self.kernel != "gdn_decode_nontranspose"
+            || self.symbol != "flashinfer_gdn_decode_nontranspose_f32_state"
         {
             return Err(Error::InvalidInput(
-                "unsupported pretransposed-decode request identity".into(),
+                "unsupported non-transposed-decode request identity".into(),
             ));
         }
         if !valid_gpu_architecture(&self.gpu_arch) {
@@ -183,14 +168,28 @@ impl PretransposeDecodeSpecialization {
         }
         if self.t != 1 {
             return Err(Error::InvalidInput(format!(
-                "pretransposed decode requires T=1, found {}",
+                "non-transposed decode requires T=1, found {}",
                 self.t
             )));
         }
-        if self.k != 128 || self.v < 128 || !self.v.is_multiple_of(64) {
+        if self.k != 128 {
             return Err(Error::InvalidInput(format!(
-                "the small-batch pretransposed decode shim requires K=128, V>=128, and V divisible by 64; found K={}, V={}",
-                self.k, self.v
+                "non-transposed decode requires K=128, found {}",
+                self.k
+            )));
+        }
+        let valid_v = match self.batch_class {
+            NontransposeDecodeBatchClass::Small => self.v >= 128 && self.v.is_multiple_of(128),
+            NontransposeDecodeBatchClass::Large => self.v >= 32 && self.v.is_multiple_of(32),
+        };
+        if !valid_v {
+            let requirement = match self.batch_class {
+                NontransposeDecodeBatchClass::Small => "V>=128 and divisible by 128",
+                NontransposeDecodeBatchClass::Large => "V>=32 and divisible by 32",
+            };
+            return Err(Error::InvalidInput(format!(
+                "the {:?} non-transposed decode kernel requires {requirement}; found V={}",
+                self.batch_class, self.v
             )));
         }
         if [self.h, self.hv, self.k, self.v, self.t]
@@ -198,7 +197,7 @@ impl PretransposeDecodeSpecialization {
             .any(|dimension| i64::try_from(dimension).is_err())
         {
             return Err(Error::InvalidInput(
-                "pretransposed decode dimensions must fit signed 64-bit DLPack shapes".into(),
+                "non-transposed decode dimensions must fit signed 64-bit DLPack shapes".into(),
             ));
         }
         if !self.scale.is_finite() || self.scale <= 0.0 {
@@ -211,40 +210,25 @@ impl PretransposeDecodeSpecialization {
     }
 }
 
-fn valid_gpu_architecture(architecture: &str) -> bool {
-    let Some(suffix) = architecture.strip_prefix("sm_") else {
-        return false;
-    };
-    let digit_count = suffix.bytes().take_while(u8::is_ascii_digit).count();
-    digit_count >= 2
-        && (digit_count == suffix.len()
-            || (digit_count + 1 == suffix.len()
-                && matches!(suffix.as_bytes()[digit_count], b'a' | b'f')))
-}
-
-impl Default for PretransposeDecodeSpecialization {
+impl Default for NontransposeDecodeSpecialization {
     fn default() -> Self {
-        Self::new("sm_121a", 16, 16, 128, 128)
-            .expect("the built-in pretransposed-decode specialization is valid")
+        Self::new("sm_121a", 16, 16, 128, 128, 1)
+            .expect("the built-in non-transposed-decode specialization is valid")
     }
 }
 
-/// Compiler adapter for the first pretransposed float-state decode specialization.
-///
-/// This is intentionally a narrow vertical slice. The generic cache and loader live
-/// in cutedsl-jit; this type owns the FlashInfer-specific source paths and worker
-/// arguments.
+/// Compiler adapter for float-state non-transposed decode.
 #[derive(Debug, Clone)]
-pub struct PretransposeDecodeCompiler {
+pub struct NontransposeDecodeCompiler {
     python: PathBuf,
     cache: ArtifactCache,
     toolchain: Value,
     flashinfer_root: PathBuf,
     timeout: Duration,
-    specialization: PretransposeDecodeSpecialization,
+    specialization: NontransposeDecodeSpecialization,
 }
 
-impl PretransposeDecodeCompiler {
+impl NontransposeDecodeCompiler {
     /// Constructs an adapter with an explicit, path-independent toolchain identity.
     pub fn new(
         python: impl Into<PathBuf>,
@@ -258,11 +242,11 @@ impl PretransposeDecodeCompiler {
             toolchain,
             flashinfer_root: source_root().to_path_buf(),
             timeout: Duration::from_secs(15 * 60),
-            specialization: PretransposeDecodeSpecialization::default(),
+            specialization: NontransposeDecodeSpecialization::default(),
         })
     }
 
-    /// Constructs an adapter from an environment created by prepare_environment.py.
+    /// Constructs an adapter from an environment created by `prepare_environment.py`.
     pub fn from_managed_python(
         python: impl Into<PathBuf>,
         cache_root: impl Into<PathBuf>,
@@ -288,9 +272,6 @@ impl PretransposeDecodeCompiler {
                 ))
             })
         };
-        // Absolute lock and runtime-library paths are deliberately excluded. The
-        // environment digest and exact package set identify the compiler without
-        // making equivalent environments in different cache roots miss.
         let toolchain = json!({
             "environment_schema_version": required("schema_version")?,
             "environment_digest": required("environment_digest")?,
@@ -317,7 +298,7 @@ impl PretransposeDecodeCompiler {
     /// Selects the exact kernel specialization to prepare.
     pub fn specialization(
         mut self,
-        specialization: PretransposeDecodeSpecialization,
+        specialization: NontransposeDecodeSpecialization,
     ) -> Result<Self> {
         specialization.validate()?;
         self.specialization = specialization;
@@ -326,7 +307,7 @@ impl PretransposeDecodeCompiler {
 
     /// Selected specialization.
     #[must_use]
-    pub fn selected_specialization(&self) -> &PretransposeDecodeSpecialization {
+    pub fn selected_specialization(&self) -> &NontransposeDecodeSpecialization {
         &self.specialization
     }
 
@@ -336,7 +317,7 @@ impl PretransposeDecodeCompiler {
         self.specialization.validate()?;
         let request = serde_json::to_value(&self.specialization).map_err(|error| {
             Error::InvalidInput(format!(
-                "failed to serialize pretransposed-decode request: {error}"
+                "failed to serialize non-transposed-decode request: {error}"
             ))
         })?;
         let toolchain = json!({
@@ -344,7 +325,7 @@ impl PretransposeDecodeCompiler {
             "host_c_compiler": host_compiler_identity()?,
         });
         CacheKey::new(
-            "flashinfer-gdn/decode-pretranspose-f32-state",
+            "flashinfer-gdn/decode-nontranspose-f32-state",
             Abi::TvmFfi,
             request,
             toolchain,
@@ -354,7 +335,7 @@ impl PretransposeDecodeCompiler {
         .with_input_file(
             "flashinfer-kernel-source",
             self.flashinfer_root
-                .join("flashinfer/gdn_kernels/gdn_decode_pretranspose.py"),
+                .join("flashinfer/gdn_kernels/gdn_decode_nontranspose.py"),
         )
     }
 
@@ -380,10 +361,10 @@ impl PretransposeDecodeCompiler {
     }
 
     /// Explicitly prepares and dynamically loads the selected specialization.
-    pub fn load(&self) -> Result<PretransposeDecodeKernel> {
+    pub fn load(&self) -> Result<NontransposeDecodeKernel> {
         let artifact = self.prepare()?;
         let module = TvmModule::load(artifact)?;
-        Ok(PretransposeDecodeKernel {
+        Ok(NontransposeDecodeKernel {
             module: Arc::new(module),
             specialization: self.specialization.clone(),
         })
@@ -400,62 +381,49 @@ fn compiler_paths() -> CompilerPaths {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let shims = manifest.join("shims");
     CompilerPaths {
-        shim: shims.join("compile_pretranspose_decode.py"),
+        shim: shims.join("compile_nontranspose_decode.py"),
         requirements_lock: shims.join("requirements/cu13-aarch64-py312.lock"),
     }
 }
 
-fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    let mut file = File::create(path).map_err(|error| {
-        Error::InvalidInput(format!("failed to create {}: {error}", path.display()))
-    })?;
-    serde_json::to_writer_pretty(&mut file, value).map_err(|error| {
-        Error::InvalidInput(format!("failed to write {}: {error}", path.display()))
-    })?;
-    file.sync_all()
-        .map_err(|error| Error::InvalidInput(format!("failed to sync {}: {error}", path.display())))
-}
-
-/// The thirteen tensor/stream arguments of the generated pretransposed decode entrypoint.
+/// The eleven tensor arguments of the generated non-transposed decode entrypoint.
 #[derive(Debug)]
-pub struct PretransposeDecodeTensors<'a> {
-    /// Direct state `[B*HV,V,K]` or pool state `[P,HV,V,K]`.
-    pub state: &'a mut DlTensor,
-    /// Log-decay parameter `[HV]`.
-    pub a_log: &'a mut DlTensor,
-    /// Input-dependent decay `[B,1,HV]`.
-    pub a: &'a mut DlTensor,
-    /// Decay bias `[HV]`.
-    pub dt_bias: &'a mut DlTensor,
+pub struct NontransposeDecodeTensors<'a> {
+    /// Reserved sequence offsets `[B+1]` for the non-varlen decode entrypoint.
+    pub cu_seqlens: &'a mut DlTensor,
     /// Query `[B,1,H,K]`.
     pub q: &'a mut DlTensor,
     /// Key `[B,1,H,K]`.
     pub k: &'a mut DlTensor,
     /// Value `[B,1,HV,V]`.
     pub v: &'a mut DlTensor,
+    /// Input-dependent decay `[B,1,HV]`.
+    pub a: &'a mut DlTensor,
     /// Update gate `[B,1,HV]`.
     pub beta: &'a mut DlTensor,
+    /// Log-decay parameter `[HV]`.
+    pub a_log: &'a mut DlTensor,
+    /// Decay bias `[HV]`.
+    pub dt_bias: &'a mut DlTensor,
+    /// Main state pool flattened to `[P*HV,K,V]`.
+    pub state: &'a mut DlTensor,
+    /// Identity state indices `[B]`.
+    pub state_indices: &'a mut DlTensor,
     /// BF16 output `[B,1,HV,V]`.
     pub output: &'a mut DlTensor,
-    /// State-pool read indices `[B]`.
-    pub state_indices: &'a mut DlTensor,
-    /// State-pool write indices `[B]`.
-    pub output_state_indices: &'a mut DlTensor,
-    /// Reserved sequence offsets `[B+1]` for the non-varlen decode entrypoint.
-    pub cu_seqlens: &'a mut DlTensor,
 }
 
-/// Loaded pretransposed float-state decode specialization.
+/// Loaded non-transposed float-state decode specialization.
 #[derive(Debug, Clone)]
-pub struct PretransposeDecodeKernel {
+pub struct NontransposeDecodeKernel {
     module: Arc<TvmModule>,
-    specialization: PretransposeDecodeSpecialization,
+    specialization: NontransposeDecodeSpecialization,
 }
 
-impl PretransposeDecodeKernel {
+impl NontransposeDecodeKernel {
     /// Specialization enforced by this generated entrypoint.
     #[must_use]
-    pub fn specialization(&self) -> &PretransposeDecodeSpecialization {
+    pub fn specialization(&self) -> &NontransposeDecodeSpecialization {
         &self.specialization
     }
 
@@ -474,22 +442,21 @@ impl PretransposeDecodeKernel {
     /// all work enqueued on `stream` has completed.
     pub unsafe fn launch(
         &self,
-        tensors: &mut PretransposeDecodeTensors<'_>,
+        tensors: &mut NontransposeDecodeTensors<'_>,
         stream: *mut c_void,
     ) -> Result<()> {
         let arguments = [
-            TvmFfiAny::tensor(tensors.state),
-            TvmFfiAny::tensor(tensors.a_log),
-            TvmFfiAny::tensor(tensors.a),
-            TvmFfiAny::tensor(tensors.dt_bias),
+            TvmFfiAny::tensor(tensors.cu_seqlens),
             TvmFfiAny::tensor(tensors.q),
             TvmFfiAny::tensor(tensors.k),
             TvmFfiAny::tensor(tensors.v),
+            TvmFfiAny::tensor(tensors.a),
             TvmFfiAny::tensor(tensors.beta),
-            TvmFfiAny::tensor(tensors.output),
+            TvmFfiAny::tensor(tensors.a_log),
+            TvmFfiAny::tensor(tensors.dt_bias),
+            TvmFfiAny::tensor(tensors.state),
             TvmFfiAny::tensor(tensors.state_indices),
-            TvmFfiAny::tensor(tensors.output_state_indices),
-            TvmFfiAny::tensor(tensors.cu_seqlens),
+            TvmFfiAny::tensor(tensors.output),
             TvmFfiAny::opaque(stream),
         ];
         // SAFETY: the caller upholds the descriptor and stream contracts above.
@@ -497,102 +464,28 @@ impl PretransposeDecodeKernel {
     }
 }
 
-fn absolute_path(path: PathBuf) -> Result<PathBuf> {
-    if path.is_absolute() {
-        return Ok(path);
-    }
-    std::env::current_dir()
-        .map(|current| current.join(path))
-        .map_err(|error| {
-            Error::InvalidInput(format!("failed to resolve current directory: {error}"))
-        })
-}
-
-fn read_json(path: &Path) -> Result<Value> {
-    let bytes = fs::read(path).map_err(|error| {
-        Error::InvalidInput(format!(
-            "failed to read JSON file {}: {error}",
-            path.display()
-        ))
-    })?;
-    serde_json::from_slice(&bytes).map_err(|error| {
-        Error::InvalidInput(format!(
-            "failed to parse JSON file {}: {error}",
-            path.display()
-        ))
-    })
-}
-
-fn host_compiler_identity() -> Result<Value> {
-    let program = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
-    let output = Command::new(&program)
-        .arg("--version")
-        .output()
-        .map_err(|error| {
-            Error::InvalidInput(format!(
-                "failed to query host C compiler {:?}: {error}",
-                program
-            ))
-        })?;
-    if !output.status.success() {
-        return Err(Error::InvalidInput(format!(
-            "host C compiler {:?} --version exited with {}",
-            program, output.status
-        )));
-    }
-    Ok(json!({
-        "program": program.to_string_lossy(),
-        "version": String::from_utf8_lossy(&output.stdout),
-    }))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn selected_source_contains_pretranspose_decode() {
-        assert_eq!(FLASHINFER_VERSION, "0.6.16.post2");
-        assert!(
-            source_root()
-                .join("flashinfer/gdn_kernels/gdn_decode_pretranspose.py")
-                .is_file()
+    fn batch_boundary_selects_distinct_classes() {
+        assert_eq!(
+            NontransposeDecodeBatchClass::for_batch(31),
+            NontransposeDecodeBatchClass::Small
         );
+        assert_eq!(
+            NontransposeDecodeBatchClass::for_batch(32),
+            NontransposeDecodeBatchClass::Large
+        );
+        assert!(NontransposeDecodeBatchClass::Small.matches(31));
+        assert!(!NontransposeDecodeBatchClass::Small.matches(32));
     }
 
     #[test]
-    fn pretranspose_cache_key_covers_all_current_inputs() {
-        let compiler = PretransposeDecodeCompiler::new(
-            "/unavailable-python-is-valid-for-a-cache-hit",
-            "target/test-cutedsl-cache",
-            json!({"environment_digest": "test"}),
-        )
-        .unwrap();
-        let key = compiler.cache_key().unwrap();
-        assert_eq!(key.abi, Abi::TvmFfi);
-        assert_eq!(key.inputs.len(), 3);
-        for name in [
-            "compiler-shim",
-            "requirements-lock",
-            "flashinfer-kernel-source",
-        ] {
-            assert!(key.inputs.contains_key(name), "missing {name}");
-        }
-        assert_eq!(key.request["gpu_arch"], "sm_121a");
-        assert!(key.toolchain.get("host_c_compiler").is_some());
-    }
-
-    #[test]
-    fn pool_indexing_is_a_distinct_specialization() {
-        let direct = PretransposeDecodeSpecialization::default();
-        let pool = direct.clone().pool_indexing(true);
-        assert_ne!(direct, pool);
-        assert!(!direct.use_pool_indexing);
-        assert!(pool.use_pool_indexing);
-    }
-
-    #[test]
-    fn specialization_rejects_incompatible_head_counts() {
-        assert!(PretransposeDecodeSpecialization::new("sm_90a", 16, 24, 128, 128).is_err());
+    fn validates_class_specific_value_tiles() {
+        assert!(NontransposeDecodeSpecialization::new("sm_90a", 16, 16, 128, 128, 1).is_ok());
+        assert!(NontransposeDecodeSpecialization::new("sm_90a", 16, 16, 128, 64, 32).is_ok());
+        assert!(NontransposeDecodeSpecialization::new("sm_90a", 16, 16, 128, 64, 1).is_err());
     }
 }

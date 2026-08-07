@@ -2,12 +2,15 @@
 
 ## Status
 
-The workspace, generic TVM artifact runtime, and first decode vertical slice are
-implemented. The pinned pretransposed float-state decode kernel can be projected
-from upstream source, compiled through a Rust-owned content-addressed cache, loaded
-behind a validated safe Rust plan, and called with Candle CUDA tensors. Direct state
-and indexed state pools have nonzero numerical coverage plus CUDA Graph capture and
-replay on SM121a. Broader decode and prefill coverage is still pending.
+The workspace, generic TVM artifact runtime, and first two decode paths are
+implemented. The pinned pretransposed and non-transposed float-state decode kernels
+can be projected from upstream source, compiled through a Rust-owned
+content-addressed cache, loaded behind validated safe Rust plans, and called with
+Candle CUDA tensors. Pretransposed direct state and indexed state pools have
+nonzero numerical coverage plus CUDA Graph capture and replay on SM121a.
+Non-transposed indexed state pools have eager numerical coverage for both FlashInfer
+launch classes (`B<32` and `B>=32`). Broader decode and prefill coverage is still
+pending.
 
 The initial source baseline is **FlashInfer 0.6.16.post2**, Git tag
 `v0.6.16.post2`, commit `c498513a891d424e9ebb2518a1a3c53122dbf257`.
@@ -403,20 +406,37 @@ convert Candle offsets into the correct device pointers, allocate outputs when t
 convenience API requests them, and translate errors into Candle errors. It must not
 duplicate kernel selection, cache policy, or the graph owner's lifecycle.
 
-The implemented pretransposed plan fixes the batch size so its placeholder index
-tensors and `cu_seqlens` allocation remain stable across capture. `forward` allocates
-and returns the output for both eager and captured execution. There is no explicit
-warmup method, output-parameter launch, warmed-state bit, capture check, or bound
-tensor wrapper. The external graph owner keeps tensors and the plan alive, supplies
-stable addresses, and disables Candle event tracking. The adapter conservatively
-rejects any state or output sharing the same CUDA allocation as another argument;
-this check prevents recursive Candle storage locking and is unrelated to graph
+The implemented decode plans fix the batch size so their index and `cu_seqlens`
+auxiliaries remain stable across capture. `forward` allocates and returns the output
+for both eager and captured execution. There is no explicit warmup method,
+output-parameter launch, warmed-state bit, capture check, or bound tensor wrapper.
+The external graph owner keeps tensors and the plan alive, supplies stable
+addresses, and disables Candle event tracking. The adapters conservatively reject
+any state or output sharing the same CUDA allocation as another argument; this
+check prevents recursive Candle storage locking and is unrelated to graph
 preparation.
 
 Indexed float-state pools retain a dynamic four-dimensional layout, but the K mode
 must be contiguous and each outer element stride must be divisible by four. This is
 the 16-byte alignment contract required by the kernel's 128-bit `cp.async` atom and
 is encoded in both the CuTeDSL fake tensor and safe Rust validation.
+
+The non-transposed Rust API accepts the persistent compact state pool
+`[P,HV,K,V]` and required int32 indices `[B]`; it does not gather a temporary
+per-batch state. The upstream device kernel already computes
+`flat_idx = pool_idx * HV + i_hv`, but its Python launch JIT derives grid size from
+the direct-state dimension `B*HV`. The versioned shim applies a checked AST
+adaptation to both small- and large-batch launch JITs so grid size comes from the
+index tensor (`B*HV`) while pool capacity remains independently dynamic (`P*HV`).
+The adapter fails compilation if the expected upstream assignments move or change.
+Indices must be in range and unique within a concurrent batch; inspecting their GPU
+values is intentionally not a host-side launch step.
+
+FlashInfer selects two different non-transposed kernels at `B=32`. The batch class
+is part of the specialization and cache key, and both core and Candle plans reject
+a fixed runtime batch belonging to the other class. For the small kernel, `V` must
+be at least 128 and divisible by 128 because its eight blocks divide 16-wide value
+tiles evenly. The large kernel accepts positive multiples of 32.
 
 ## Source and version policy
 
@@ -495,6 +515,12 @@ Observed maximum errors for the deterministic `H=HV=1`, `K=V=128`, `B=2` case we
 indexed output, and `2.9e-9` for indexed destination state. These are implementation
 acceptance values, not promised public tolerances.
 
+The eager-only `nontranspose-decode` acceptance executable covers both upstream
+execution classes with indexed K-major state pools. On the same SM121a host, observed
+maximum errors were `1.50e-5` output and `1.9e-9` state for `B=2`, and `1.53e-5`
+output and `3.8e-9` state for `B=32`. CUDA Graph replay is intentionally left to the
+external graph owner and was not repeated for this second kernel.
+
 ### ABI decision benchmark
 
 Benchmark eager TVM safe-call overhead and captured/replayed decode separately. The
@@ -514,7 +540,9 @@ with the upstream TVM ABI.
 3. **Decode vertical slice (complete)** — pretransposed decode, direct and indexed
    float state, Candle integration, numerical tests, external eager warmup, and CUDA
    Graph replay on multiple explicit streams.
-4. **Decode coverage** — non-transposed, BF16-state, and MTP variants.
+4. **Decode coverage (in progress)** — non-transposed float-state indexed-pool
+   decode is complete for small and large batches; BF16-state and MTP variants
+   remain.
 5. **Prefill coverage** — chunked prefill followed by context-parallel prefill.
 6. **Hardening** — supported version matrix, reproducible source distribution,
    concurrent cache tests, diagnostics, examples, and benchmarks.

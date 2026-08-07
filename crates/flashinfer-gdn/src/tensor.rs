@@ -1,6 +1,8 @@
 use std::ffi::c_void;
 use std::ptr::NonNull;
 
+use flashinfer_gdn_sys::{DlDevice, DlDeviceType, DlTensor};
+
 use crate::{Error, Result};
 
 /// Element types currently accepted by the first GDN decode slice.
@@ -203,6 +205,38 @@ impl CudaTensor {
                         Error::tensor("descriptor", "shape/stride element offset overflows i64")
                     })
             })
+    }
+}
+
+pub(crate) struct DlTensorOwner<'a> {
+    pub(crate) tensor: DlTensor,
+    _source: std::marker::PhantomData<&'a CudaTensor>,
+}
+
+impl<'a> DlTensorOwner<'a> {
+    pub(crate) fn from_tensor(source: &'a CudaTensor) -> Result<Self> {
+        let ndim = i32::try_from(source.shape().len()).map_err(|_| {
+            Error::tensor(
+                "descriptor",
+                format!("tensor rank exceeds i32: {}", source.shape().len()),
+            )
+        })?;
+        let tensor = DlTensor {
+            data: source.data(),
+            device: DlDevice {
+                device_type: DlDeviceType::Cuda,
+                device_id: source.device_id(),
+            },
+            ndim,
+            dtype: source.dtype().dlpack(),
+            shape: source.shape().as_ptr().cast_mut(),
+            strides: source.strides().as_ptr().cast_mut(),
+            byte_offset: source.byte_offset(),
+        };
+        Ok(Self {
+            tensor,
+            _source: std::marker::PhantomData,
+        })
     }
 }
 

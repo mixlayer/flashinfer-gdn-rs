@@ -8,11 +8,16 @@
 
 mod decode;
 mod error;
+mod nontranspose_decode;
 mod tensor;
 
 pub use decode::{PretransposeDecodeCall, PretransposeDecodePlan, validate_pretranspose_decode};
 pub use error::{Error, Result};
 pub use flashinfer_gdn_sys::{
-    DtBiasDType, InputDType, PretransposeDecodeCompiler, PretransposeDecodeSpecialization,
+    DtBiasDType, InputDType, NontransposeDecodeBatchClass, NontransposeDecodeCompiler,
+    NontransposeDecodeSpecialization, PretransposeDecodeCompiler, PretransposeDecodeSpecialization,
+};
+pub use nontranspose_decode::{
+    NontransposeDecodeCall, NontransposeDecodePlan, validate_nontranspose_decode,
 };
 pub use tensor::{CudaStream, CudaTensor, DType};
