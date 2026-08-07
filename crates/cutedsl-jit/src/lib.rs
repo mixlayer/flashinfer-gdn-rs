@@ -12,6 +12,7 @@ mod digest;
 mod error;
 mod model;
 mod tvm;
+mod tvm_ffi;
 
 pub use cache::{Artifact, ArtifactCache};
 pub use command::CompilerCommand;
@@ -21,3 +22,7 @@ pub use model::{
     RuntimeLibrary,
 };
 pub use tvm::{TvmFfiVersion, TvmModule};
+pub use tvm_ffi::{
+    DlDataType, DlDataTypeCode, DlDevice, DlDeviceType, DlTensor, TvmFfiAny, TvmFfiAnyData,
+    TvmFfiSafeCall, TvmFfiTypeIndex,
+};

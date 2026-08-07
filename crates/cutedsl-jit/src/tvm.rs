@@ -3,9 +3,9 @@ use std::fmt;
 
 use libloading::os::unix::{Library, RTLD_GLOBAL, RTLD_NOW};
 
+use crate::tvm_ffi::{TvmFfiAny, TvmFfiSafeCall};
 use crate::{Abi, Artifact, Error, Result};
 
-type SafeCall = unsafe extern "C" fn(*mut c_void, *const c_void, i32, *mut c_void) -> i32;
 type ErrorMoveFromRaised = unsafe extern "C" fn(*mut *mut c_void);
 type ObjectDecRef = unsafe extern "C" fn(*mut c_void) -> i32;
 type GetVersion = unsafe extern "C" fn(*mut TvmFfiVersion);
@@ -31,7 +31,7 @@ impl fmt::Display for TvmFfiVersion {
 /// Loaded TVM FFI module whose dependencies and ABI version have been validated.
 pub struct TvmModule {
     artifact: Artifact,
-    entry: SafeCall,
+    entry: TvmFfiSafeCall,
     error_move_from_raised: ErrorMoveFromRaised,
     object_dec_ref: ObjectDecRef,
     version: TvmFfiVersion,
@@ -130,7 +130,7 @@ impl TvmModule {
         // generated TVM safe-call symbol.
         let entry = unsafe {
             *module
-                .get::<SafeCall>(entry_name.as_bytes_with_nul())
+                .get::<TvmFfiSafeCall>(entry_name.as_bytes_with_nul())
                 .map_err(|error| {
                     Error::DynamicLoad(format!(
                         "failed to resolve {}: {error}",
@@ -160,6 +160,31 @@ impl TvmModule {
         self.version
     }
 
+    /// Calls the generated entrypoint with typed TVM FFI arguments.
+    ///
+    /// # Safety
+    ///
+    /// Every argument payload must satisfy the generated entrypoint contract for
+    /// the duration of the call and any asynchronous work it enqueues.
+    pub unsafe fn call(&self, arguments: &[TvmFfiAny]) -> Result<()> {
+        let argument_count = i32::try_from(arguments.len()).map_err(|_| {
+            Error::InvalidInput(format!(
+                "TVM FFI argument count exceeds i32: {}",
+                arguments.len()
+            ))
+        })?;
+        let mut result = TvmFfiAny::none();
+        // SAFETY: the caller upholds each argument's generated ABI contract.
+        unsafe {
+            self.call_raw(
+                std::ptr::null_mut(),
+                arguments.as_ptr().cast(),
+                argument_count,
+                std::ptr::from_mut(&mut result).cast(),
+            )
+        }
+    }
+
     /// Calls the generated TVM FFI entrypoint and releases any raised error object.
     ///
     /// # Safety
@@ -176,7 +201,14 @@ impl TvmModule {
         result: *mut c_void,
     ) -> Result<()> {
         // SAFETY: caller upholds the generated safe-call argument contract.
-        let status = unsafe { (self.entry)(resource_handle, arguments, argument_count, result) };
+        let status = unsafe {
+            (self.entry)(
+                resource_handle,
+                arguments.cast(),
+                argument_count,
+                result.cast(),
+            )
+        };
         if status == 0 {
             return Ok(());
         }

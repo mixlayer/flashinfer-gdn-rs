@@ -267,6 +267,7 @@ name = "flashinfer-gdn"
 version = "0.1.0"
 dependencies = [
  "flashinfer-gdn-sys",
+ "thiserror 2.0.19",
 ]
 
 [[package]]
@@ -274,6 +275,7 @@ name = "flashinfer-gdn-sys"
 version = "0.1.0"
 dependencies = [
  "cutedsl-jit",
+ "serde",
  "serde_json",
 ]
 

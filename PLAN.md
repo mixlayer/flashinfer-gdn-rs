@@ -2,12 +2,12 @@
 
 ## Status
 
-The workspace, first compiler feasibility slice, and generic TVM artifact runtime
-are implemented. The pinned pretransposed float-state decode kernel can be projected
+The workspace, generic TVM artifact runtime, and first decode vertical slice are
+implemented. The pinned pretransposed float-state decode kernel can be projected
 from upstream source, compiled through a Rust-owned content-addressed cache, loaded
-from Rust, and launched through a native CUDA smoke harness. The safe Rust GDN
-operation and Candle adapter are still scaffolds; this is not yet a consumer-facing
-binding.
+behind a validated safe Rust plan, and called with Candle CUDA tensors. Direct state
+and indexed state pools have nonzero numerical coverage plus CUDA Graph capture and
+replay on SM121a. Broader decode and prefill coverage is still pending.
 
 The initial source baseline is **FlashInfer 0.6.16.post2**, Git tag
 `v0.6.16.post2`, commit `c498513a891d424e9ebb2518a1a3c53122dbf257`.
@@ -31,7 +31,8 @@ packed ABI.
 - Keep the compilation, artifact, cache, and loading machinery reusable by other
   CuTeDSL libraries.
 - Provide a framework-independent safe Rust API and a separate Candle adapter.
-- Make decode APIs safe to warm up, capture, and replay with CUDA Graphs.
+- Make decode APIs composable with an external CUDA Graph warmup, capture, and
+  replay lifecycle.
 - Preserve upstream kernel behavior and specialization choices instead of porting
   the kernels or launch policy to Rust.
 
@@ -333,14 +334,16 @@ ownership.
 
 Graph support is a first-class requirement for decode:
 
-- JIT compilation, module loading, symbol resolution, output allocation, and
-  workspace allocation happen during plan creation or explicit warmup, before
-  capture begins.
-- A cache miss observed during stream capture returns a specific error; it never
-  starts Python, takes a long-lived build lock, or invokes a compiler.
+- JIT compilation, module loading, symbol resolution, and plan-owned auxiliary
+  allocation happen in `prepare`, before the operation is invoked by a graph owner.
+- A prepared plan never starts Python, takes a build lock, or performs file I/O from
+  its launch path.
 - The caller supplies the capture stream explicitly, and every launch uses it.
-- Launches perform no device synchronization, implicit allocation, logging, or file
-  I/O.
+- The same launch method is used for eager execution and capture. The GDN crates do
+  not track an internal warmed/capturing state or expose a separate bound launch.
+- Launches perform no device synchronization, device allocation, logging, or file
+  I/O. Host-side descriptor construction and validation remain ordinary launch
+  work.
 - Kernel modules and plan-owned metadata remain alive at least as long as any graph
   executable that references their kernel nodes.
 - Tensor and workspace addresses used by a captured graph remain stable across
@@ -350,12 +353,20 @@ Graph support is a first-class requirement for decode:
   objects whose lifetimes must span replay.
 - Plans are associated with a CUDA device and specialization. Reusing a plan on a
   different device is rejected.
-- APIs provide an explicit `prepare`/warmup path so applications can compile every
-  required batch/shape variant before capture.
+- Applications prepare every required batch/shape variant before handing execution
+  to their graph runtime.
+- Candle capture must use an explicitly created non-default stream; CUDA does not
+  permit capture on its legacy/default stream. `Device::new_cuda_with_stream` meets
+  this requirement, whereas `Device::new_cuda` does not.
+- Candle's event tracker must be disabled by the graph owner before capture. This is
+  already part of `modeld-core` device initialization and graph tests.
 
-Graph tests must exercise capture followed by multiple replays with changed input
-contents, optional state pools, and more than one CUDA stream. We should also verify
-that a cold specialization fails predictably when requested inside capture.
+`modeld-core::cuda_graph::GraphCache` owns the integration lifecycle: it invokes the
+module body eagerly for warmup and reference output, pins graph inputs/outputs, then
+invokes the same body during capture. GDN plan preparation belongs in model setup or
+`GraphModule::prepare_capture`; it is not coupled to those eager passes. Graph tests
+must exercise capture followed by multiple replays with changed input contents,
+optional state pools, and more than one CUDA stream.
 
 ## Initial GDN kernel scope
 
@@ -383,14 +394,29 @@ CUDA pointer, device, dtype, shape, and element strides. Its responsibilities ar
   argument;
 - architecture and specialization selection;
 - output and workspace layout calculation;
-- plan preparation and warmup;
+- plan preparation;
 - module lifetime and graph-safety invariants; and
 - forwarding a caller-provided CUDA stream.
 
 `candle-flashinfer-gdn` will verify CUDA storage and contiguous/strided layouts,
-convert Candle offsets into the correct device pointers, allocate outputs and
-workspace outside capture, and translate errors into Candle errors. It must not
-duplicate kernel selection or cache policy.
+convert Candle offsets into the correct device pointers, allocate outputs when the
+convenience API requests them, and translate errors into Candle errors. It must not
+duplicate kernel selection, cache policy, or the graph owner's lifecycle.
+
+The implemented pretransposed plan fixes the batch size so its placeholder index
+tensors and `cu_seqlens` allocation remain stable across capture. `forward` allocates
+and returns the output for both eager and captured execution. There is no explicit
+warmup method, output-parameter launch, warmed-state bit, capture check, or bound
+tensor wrapper. The external graph owner keeps tensors and the plan alive, supplies
+stable addresses, and disables Candle event tracking. The adapter conservatively
+rejects any state or output sharing the same CUDA allocation as another argument;
+this check prevents recursive Candle storage locking and is unrelated to graph
+preparation.
+
+Indexed float-state pools retain a dynamic four-dimensional layout, but the K mode
+must be contiguous and each outer element stride must be divisible by four. This is
+the 16-byte alignment contract required by the kernel's 128-bit `cp.async` atom and
+is encoded in both the CuTeDSL fake tensor and safe Rust validation.
 
 ## Source and version policy
 
@@ -452,6 +478,23 @@ CPU tests. The remaining CPU gates are:
 - CUDA Graph capture and repeated replay; and
 - module/cache lifetime behavior while graphs remain alive.
 
+The `decode-vertical` acceptance executable now covers the first-kernel subset of
+these gates on an NVIDIA GB10 (SM121a):
+
+- nonzero BF16-input/float-state direct decode against a Rust float reference;
+- in-place state comparison as well as BF16 output comparison;
+- indexed pools with distinct read and write slots;
+- global capture and repeated replay with graph-stable addresses;
+- replay after changing input contents at the same address; and
+- capture and replay on a second explicit CUDA stream; and
+- the same `forward` call for eager warmup/reference execution and capture, with
+  event tracking disabled as it is in `modeld-core`.
+
+Observed maximum errors for the deterministic `H=HV=1`, `K=V=128`, `B=2` case were
+`2.55e-5` for direct BF16 output, `2.8e-9` for direct float state, `2.96e-5` for
+indexed output, and `2.9e-9` for indexed destination state. These are implementation
+acceptance values, not promised public tolerances.
+
 ### ABI decision benchmark
 
 Benchmark eager TVM safe-call overhead and captured/replayed decode separately. The
@@ -468,8 +511,9 @@ with the upstream TVM ABI.
    subprocess timeout/logging, failure and corruption retention, AOT export/link,
    atomic publication, manifest validation, and the TVM module loader are proven by
    CPU tests and the GDN GPU smoke path.
-3. **Decode vertical slice** — pretransposed decode, Candle integration, numerical
-   tests, explicit warmup, and CUDA Graph replay.
+3. **Decode vertical slice (complete)** — pretransposed decode, direct and indexed
+   float state, Candle integration, numerical tests, external eager warmup, and CUDA
+   Graph replay on multiple explicit streams.
 4. **Decode coverage** — non-transposed, BF16-state, and MTP variants.
 5. **Prefill coverage** — chunked prefill followed by context-parallel prefill.
 6. **Hardening** — supported version matrix, reproducible source distribution,
@@ -480,8 +524,6 @@ with the upstream TVM ABI.
 
 ## Open questions
 
-- Should raw TVM FFI definitions come from an upstream Rust sys crate or bindgen
-  output checked against the pinned official headers?
 - What exact package versions form the first CUDA 12 lock, and which architectures
   need it? The first CUDA 13 aarch64/Python 3.12 lock is established.
 - Can every remaining GDN module be isolated from Torch as safely as pretransposed

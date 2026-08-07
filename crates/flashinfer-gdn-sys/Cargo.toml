@@ -12,4 +12,5 @@ flashinfer-git-rev = "c498513a891d424e9ebb2518a1a3c53122dbf257"
 
 [dependencies]
 cutedsl-jit.workspace = true
+serde.workspace = true
 serde_json.workspace = true

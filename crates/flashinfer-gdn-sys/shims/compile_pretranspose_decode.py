@@ -15,6 +15,7 @@ import ctypes
 import hashlib
 import importlib.metadata
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -103,17 +104,21 @@ def _load_request(path: Path) -> dict[str, Any]:
             raise ValueError(f"{name} must be a positive integer")
     if request["t"] != 1:
         raise ValueError("the pretranspose decode spike only supports t=1")
-    if request["k"] < 128:
-        raise ValueError("k must be at least 128")
-    if request["v"] < 128 or request["v"] % 8:
-        raise ValueError("v must be at least 128 and divisible by 8")
-    if not isinstance(request["scale"], (int, float)) or request["scale"] <= 0:
-        raise ValueError("scale must be a positive number")
+    if request["hv"] < request["h"] or request["hv"] % request["h"]:
+        raise ValueError("hv must be a positive multiple of h")
+    if request["k"] != 128:
+        raise ValueError("the small-batch shim requires k=128")
+    if request["v"] < 128 or request["v"] % 64:
+        raise ValueError("the small-batch shim requires v>=128 divisible by 64")
+    if (
+        not isinstance(request["scale"], (int, float))
+        or not math.isfinite(request["scale"])
+        or request["scale"] <= 0
+    ):
+        raise ValueError("scale must be a positive finite number")
     for name in ("use_qk_l2norm", "use_pool_indexing"):
         if not isinstance(request[name], bool):
             raise ValueError(f"{name} must be a boolean")
-    if request["use_pool_indexing"]:
-        raise ValueError("the first compiler spike only supports direct-state decode")
     return request
 
 
@@ -258,12 +263,28 @@ def _compile(request: dict[str, Any], source_file: Path, object_path: Path) -> l
             assumed_align=16,
         )
 
-    h0_source = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32,
-        (batch_hv, v, k),
-        stride_order=(2, 1, 0),
-        assumed_align=16,
-    )
+    if request["use_pool_indexing"]:
+        pool_size = cute.sym_int64(symbol="pool_size")
+        # The kernel's cp.async atom moves 128 bits. K is contiguous, while
+        # every outer float-state stride must preserve 16-byte alignment.
+        h0_source = cute.runtime.make_fake_tensor(
+            cutlass.Float32,
+            (pool_size, hv, v, k),
+            (
+                cute.sym_int64(symbol="h0_stride_0", divisibility=4),
+                cute.sym_int64(symbol="h0_stride_1", divisibility=4),
+                cute.sym_int64(symbol="h0_stride_2", divisibility=4),
+                1,
+            ),
+            assumed_align=16,
+        )
+    else:
+        h0_source = cute.runtime.make_fake_compact_tensor(
+            cutlass.Float32,
+            (batch_hv, v, k),
+            stride_order=(2, 1, 0),
+            assumed_align=16,
+        )
     a_log = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32, (hv,), assumed_align=16
     )
@@ -318,7 +339,7 @@ def _compile(request: dict[str, Any], source_file: Path, object_path: Path) -> l
         V=v,
         use_initial_state=True,
         use_qk_l2norm=request["use_qk_l2norm"],
-        use_pool_indexing=False,
+        use_pool_indexing=request["use_pool_indexing"],
         is_varlen=False,
         stream=stream,
         options=compile_options,
@@ -405,6 +426,10 @@ def main() -> None:
         "torch_required": False,
         "request": request,
         "artifacts": {
+            "request": {
+                "path": request_path.name,
+                "sha256": _sha256(request_path),
+            },
             "generated_source": {
                 "path": "kernel_source.py",
                 "sha256": _sha256(output_dir / "kernel_source.py"),
