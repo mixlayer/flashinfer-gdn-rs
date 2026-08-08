@@ -2,15 +2,16 @@
 
 ## Status
 
-The workspace, generic TVM artifact runtime, and first two decode paths are
-implemented. The pinned pretransposed and non-transposed float-state decode kernels
-can be projected from upstream source, compiled through a Rust-owned
-content-addressed cache, loaded behind validated safe Rust plans, and called with
-Candle CUDA tensors. Pretransposed direct state and indexed state pools have
-nonzero numerical coverage plus CUDA Graph capture and replay on SM121a.
-Non-transposed indexed state pools have eager numerical coverage for both FlashInfer
-launch classes (`B<32` and `B>=32`). Broader decode and prefill coverage is still
-pending.
+The workspace, generic TVM artifact runtime, and four decode paths are implemented.
+The pinned pretransposed and non-transposed float-state kernels and BF16-state
+single-token and checkpointed MTP kernels can be projected from upstream source,
+compiled through a Rust-owned content-addressed cache, loaded behind validated safe
+Rust plans, and called with Candle CUDA tensors. Pretransposed direct state and
+indexed state pools have nonzero numerical coverage plus CUDA Graph capture and
+replay on SM121a. Non-transposed indexed float-state pools, same-slot indexed
+BF16-state pools, and per-token MTP checkpoint scatter have eager numerical coverage
+across their upstream dispatch families. Accepted-prefix fused recovery, split-pool
+writes, and prefill coverage remain pending.
 
 The initial source baseline is **FlashInfer 0.6.16.post2**, Git tag
 `v0.6.16.post2`, commit `c498513a891d424e9ebb2518a1a3c53122dbf257`.
@@ -438,6 +439,39 @@ a fixed runtime batch belonging to the other class. For the small kernel, `V` mu
 be at least 128 and divisible by 128 because its eight blocks divide 16-wide value
 tiles evenly. The large kernel accepts positive multiples of 32.
 
+BF16-state T=1 decode accepts a persistent V-major BF16 pool `[P,HV,V,K]` plus
+required int32 indices `[B]`. The initial API passes those indices to both the read
+and write arguments, so each request updates its selected slot in place without a
+host gather. Indices must be in range and unique within a concurrent batch. Split
+read/write pools remain a future variant rather than optional complexity in this
+first single-token plan.
+
+The pinned BF16-state kernel fixes `K=V=128`, uses BF16 inputs/state/output and a
+float32 decay bias, and requires compact 32-byte-aligned storage. Its upstream
+dispatcher selects ILP4 below `B*HV=512` and a wide-vector T=1 kernel at or above
+that threshold, with tile size also depending on workload and (for ILP4) the actual
+SM count. The selected variant, tile size, and packed-FMA architecture choice are
+compile-time fields in the artifact key. The Candle plan queries the device SM count
+once during preparation and rejects a specialization that does not match upstream;
+launches themselves do not query the device or synchronize.
+
+Checkpointed BF16-state MTP processes compile-time `T>=2` tokens sequentially and
+emits the full `[B,T,HV,V]` output. It reads `h_0` from `[B]` indices into the same
+persistent `[P,HV,V,K]` pool, preserves those input slots, and takes required
+`[B,T]` checkpoint indices naming fresh slots that receive `h_1` through `h_T`.
+After sampling accepts `A` tokens for a request, `A=0` retains its input index and
+`A>0` selects `checkpoint_indices[b,A-1]`; applying the sampling result therefore
+requires no state gather or copy. Unselected checkpoint slots can return to the
+pool allocator.
+
+The upstream MTP dispatcher selects ILP4 with `tile_v=16` below `B*HV=128`, then
+the general wide-vector kernel with `tile_v=32`, `64`, or `128` at work-unit
+thresholds 128, 512, and 1024. `T`, dispatch family, and tile size are artifact-key
+fields. The compact-pool specialization compiles upstream per-token flat scatter
+on, while accepted-prefix fused recovery, dense intermediate caching, and split
+read/write indices remain off. Those remaining modes change generated code or state
+semantics and will be separate specializations.
+
 ## Source and version policy
 
 `flashinfer-gdn-sys` pins FlashInfer 0.6.16.post2 at commit
@@ -521,6 +555,23 @@ maximum errors were `1.50e-5` output and `1.9e-9` state for `B=2`, and `1.53e-5`
 output and `3.8e-9` state for `B=32`. CUDA Graph replay is intentionally left to the
 external graph owner and was not repeated for this second kernel.
 
+The eager-only `bf16-state-decode` acceptance executable covers both upstream
+BF16-state dispatch families with nonidentity indices into a larger V-major pool.
+On the same SM121a host, the `B=2`, `HV=1` ILP4 case observed zero output error and
+`7.45e-9` state error; the `B=512`, `HV=1` wide-vector case observed `1.91e-6`
+output error and `6.10e-5` state error. Expected values are quantized through BF16
+before comparison. CUDA Graph replay remains the responsibility of the external
+graph owner and was not duplicated for this kernel.
+
+The eager-only `bf16-state-mtp` acceptance executable covers checkpointed `T=2`
+execution in both upstream MTP dispatch families. It verifies that the input slots
+remain unchanged and that both post-token states land in their caller-selected
+slots. The `B=2`, `HV=1` ILP4 case observed zero output error and `3.05e-5` maximum
+pool error; the `B=128`, `HV=1` wide-vector case observed `3.05e-5` output error and
+`6.10e-5` pool error on SM121a. The reference keeps recurrent state in float32
+between tokens and quantizes each stored checkpoint through BF16. CUDA Graph replay
+remains owned by the external graph runtime.
+
 ### ABI decision benchmark
 
 Benchmark eager TVM safe-call overhead and captured/replayed decode separately. The
@@ -541,8 +592,9 @@ with the upstream TVM ABI.
    float state, Candle integration, numerical tests, external eager warmup, and CUDA
    Graph replay on multiple explicit streams.
 4. **Decode coverage (in progress)** — non-transposed float-state indexed-pool
-   decode is complete for small and large batches; BF16-state and MTP variants
-   remain.
+   decode is complete for small and large batches, and same-slot BF16-state T=1
+   decode plus checkpointed `T>=2` MTP are complete for ILP4 and wide-vector
+   dispatch. Split-pool and accepted-prefix fused-recovery variants remain.
 5. **Prefill coverage** — chunked prefill followed by context-parallel prefill.
 6. **Hardening** — supported version matrix, reproducible source distribution,
    concurrent cache tests, diagnostics, examples, and benchmarks.

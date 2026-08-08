@@ -18,8 +18,18 @@ use cutedsl_jit::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+mod bf16_state_decode;
+mod bf16_state_mtp;
 mod nontranspose_decode;
 
+pub use bf16_state_decode::{
+    Bf16StateDecodeCompiler, Bf16StateDecodeKernel, Bf16StateDecodeKernelVariant,
+    Bf16StateDecodeSpecialization, Bf16StateDecodeTensors,
+};
+pub use bf16_state_mtp::{
+    Bf16StateMtpCompiler, Bf16StateMtpKernel, Bf16StateMtpKernelVariant,
+    Bf16StateMtpSpecialization, Bf16StateMtpTensors,
+};
 pub use nontranspose_decode::{
     NontransposeDecodeBatchClass, NontransposeDecodeCompiler, NontransposeDecodeKernel,
     NontransposeDecodeSpecialization, NontransposeDecodeTensors,
@@ -267,36 +277,7 @@ impl PretransposeDecodeCompiler {
         python: impl Into<PathBuf>,
         cache_root: impl Into<PathBuf>,
     ) -> Result<Self> {
-        let python = absolute_path(python.into())?;
-        let environment = python
-            .parent()
-            .and_then(Path::parent)
-            .ok_or_else(|| Error::InvalidInput("compiler Python has no environment root".into()))?;
-        let marker_path = environment.join("environment.json");
-        let marker = read_json(&marker_path)?;
-        let marker = marker.as_object().ok_or_else(|| {
-            Error::InvalidInput(format!(
-                "managed environment marker is not an object: {}",
-                marker_path.display()
-            ))
-        })?;
-        let required = |name: &str| {
-            marker.get(name).cloned().ok_or_else(|| {
-                Error::InvalidInput(format!(
-                    "managed environment marker {} has no {name:?} field",
-                    marker_path.display()
-                ))
-            })
-        };
-        // Absolute lock and runtime-library paths are deliberately excluded. The
-        // environment digest and exact package set identify the compiler without
-        // making equivalent environments in different cache roots miss.
-        let toolchain = json!({
-            "environment_schema_version": required("schema_version")?,
-            "environment_digest": required("environment_digest")?,
-            "python": required("python")?,
-            "packages": required("packages")?,
-        });
+        let (python, toolchain) = managed_python_toolchain(python.into())?;
         Self::new(python, cache_root, toolchain)
     }
 
@@ -350,6 +331,7 @@ impl PretransposeDecodeCompiler {
             toolchain,
         )?
         .with_input_file("compiler-shim", &paths.shim)?
+        .with_input_file("compiler-support", &paths.support)?
         .with_input_file("requirements-lock", &paths.requirements_lock)?
         .with_input_file(
             "flashinfer-kernel-source",
@@ -393,6 +375,7 @@ impl PretransposeDecodeCompiler {
 #[derive(Debug)]
 struct CompilerPaths {
     shim: PathBuf,
+    support: PathBuf,
     requirements_lock: PathBuf,
 }
 
@@ -401,6 +384,7 @@ fn compiler_paths() -> CompilerPaths {
     let shims = manifest.join("shims");
     CompilerPaths {
         shim: shims.join("compile_pretranspose_decode.py"),
+        support: shims.join("_artifact.py"),
         requirements_lock: shims.join("requirements/cu13-aarch64-py312.lock"),
     }
 }
@@ -523,6 +507,40 @@ fn read_json(path: &Path) -> Result<Value> {
     })
 }
 
+fn managed_python_toolchain(python: PathBuf) -> Result<(PathBuf, Value)> {
+    let python = absolute_path(python)?;
+    let environment = python
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| Error::InvalidInput("compiler Python has no environment root".into()))?;
+    let marker_path = environment.join("environment.json");
+    let marker = read_json(&marker_path)?;
+    let marker = marker.as_object().ok_or_else(|| {
+        Error::InvalidInput(format!(
+            "managed environment marker is not an object: {}",
+            marker_path.display()
+        ))
+    })?;
+    let required = |name: &str| {
+        marker.get(name).cloned().ok_or_else(|| {
+            Error::InvalidInput(format!(
+                "managed environment marker {} has no {name:?} field",
+                marker_path.display()
+            ))
+        })
+    };
+    // Absolute lock and runtime-library paths are deliberately excluded. The
+    // environment digest and exact package set identify the compiler without
+    // making equivalent environments in different cache roots miss.
+    let toolchain = json!({
+        "environment_schema_version": required("schema_version")?,
+        "environment_digest": required("environment_digest")?,
+        "python": required("python")?,
+        "packages": required("packages")?,
+    });
+    Ok((python, toolchain))
+}
+
 fn host_compiler_identity() -> Result<Value> {
     let program = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
     let output = Command::new(&program)
@@ -570,9 +588,10 @@ mod tests {
         .unwrap();
         let key = compiler.cache_key().unwrap();
         assert_eq!(key.abi, Abi::TvmFfi);
-        assert_eq!(key.inputs.len(), 3);
+        assert_eq!(key.inputs.len(), 4);
         for name in [
             "compiler-shim",
+            "compiler-support",
             "requirements-lock",
             "flashinfer-kernel-source",
         ] {

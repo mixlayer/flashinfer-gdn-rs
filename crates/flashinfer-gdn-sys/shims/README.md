@@ -5,13 +5,16 @@ from the Cargo-provided source tree, construct specialization inputs, compile wi
 `--enable-tvm-ffi`, and export a loadable AOT artifact. They do not install
 FlashInfer or assume it is present in site-packages.
 
-The implemented requests cover pretransposed and non-transposed float-state decode.
-Each compiler parses the exact upstream file and emits an auditable, Torch-free
-kernel projection into the artifact before invoking CuTeDSL. The non-transposed
-request also records whether FlashInfer's small- or large-batch implementation is
-compiled and applies a checked launch-grid adaptation so a dynamic persistent state
-pool can be indexed without a gather. These source adapters are specific to the
-pinned FlashInfer revision.
+The implemented requests cover pretransposed and non-transposed float-state decode,
+plus same-slot BF16-state T=1 and checkpointed `T>=2` MTP decode. Each compiler parses
+the exact upstream file and emits an auditable, Torch-free kernel projection into
+the artifact before invoking CuTeDSL. The non-transposed request also records
+whether FlashInfer's small- or large-batch implementation is compiled and applies a
+checked launch-grid adaptation so a dynamic persistent state pool can be indexed
+without a gather. BF16-state requests record compile-time `T`, the upstream-selected
+ILP4, dedicated T=1 wide-vector, or general MTP wide-vector implementation, tile
+size, packed-FMA choice, and compact-pool per-token scatter mode. These source
+adapters are specific to the pinned FlashInfer revision.
 
 From the workspace root, prepare the current Linux aarch64/Python 3.12/CUDA 13
 environment with:
@@ -60,7 +63,7 @@ The Rust executable tests digest validation, dynamic loading, symbol resolution,
 the structured TVM error path. The native harness additionally launches the kernel
 with real CUDA tensors and verifies the zero-input result.
 
-Shim contents, the consumed upstream source file, the exact request and environment
-lock, the generated kernel source, and the host linker identity all participate in
-the artifact contract. The fixed request remains a feasibility slice; the next layer
-will generate requests from safe Rust GDN plan descriptors.
+Shim and shared artifact-helper contents, the consumed upstream source file, the
+exact request and environment lock, the generated kernel source, and the host linker
+identity all participate in the artifact contract. Rust plans generate the decode
+requests and validate their runtime tensor contracts.

@@ -1,16 +1,34 @@
 # candle-flashinfer-gdn
 
 Candle integration for the prepared FlashInfer GDN kernels in this workspace. The
-supported operations are BF16-input, float-state `T=1` decode with either:
+supported `T=1` decode operations are:
 
-- pretransposed `[B,HV,V,K]` direct state or indexed state pools; or
-- non-transposed `[P,HV,K,V]` compact state pools selected by int32 `[B]` indices.
+- BF16-input, float-state pretransposed `[B,HV,V,K]` direct state or indexed pools;
+- BF16-input, float-state non-transposed `[P,HV,K,V]` compact pools selected by
+  int32 `[B]` indices; and
+- BF16-input, BF16-state `[P,HV,V,K]` compact pools selected and updated in the same
+  slots by int32 `[B]` indices; and
+- checkpointed BF16-state MTP over compile-time `T>=2`, returning `[B,T,HV,V]`
+  while writing `h_1…h_T` to caller-selected slots in the same state pool.
 
 Non-transposed decode compiles distinct small- (`B<32`) and large-batch (`B>=32`)
 artifacts. Construct its specialization with the same fixed batch passed to
 `NontransposeDecodePlan::prepare`.
 The pool is passed directly to the kernel; the adapter does not gather a temporary
 batch-sized state tensor.
+
+BF16-state decode fixes `K=V=128` and compiles the upstream ILP4 or wide-vector
+implementation selected from `B*HV` and the device SM count. Its state pool must be
+compact and 32-byte aligned. The initial adapter intentionally supports same-slot
+updates only; split read/write pools are a separate future kernel variant.
+
+BF16-state MTP uses ILP4 below `B*HV=128` and the general wide-vector kernel at or
+above that threshold. `T` is compile-time and part of the artifact key. The initial
+adapter requires `checkpoint_indices: [B,T]`. These entries name mutually distinct,
+fresh slots in the main `[P,HV,V,K]` pool and must not overlap the `[B]` input slots.
+After sampling accepts `A` tokens, retain the input slot for `A=0`; otherwise select
+`checkpoint_indices[b,A-1]` as the request's active state. Accepted-step fused
+recovery and dense intermediate-state caching remain separate specializations.
 
 The intended lifecycle is:
 
@@ -48,6 +66,26 @@ The eager-only non-transposed acceptance test covers both FlashInfer batch class
 ```shell
 RUSTFLAGS="-C target-cpu=native" \
 cargo run -p candle-flashinfer-gdn --bin nontranspose-decode -- \
+  /path/to/managed-env/bin/python \
+  .cutedsl-jit-cache/runtime
+```
+
+The eager-only BF16-state acceptance test covers both the ILP4 and wide-vector
+dispatch families with indexed pools:
+
+```shell
+RUSTFLAGS="-C target-cpu=native" \
+cargo run -p candle-flashinfer-gdn --bin bf16-state-decode -- \
+  /path/to/managed-env/bin/python \
+  .cutedsl-jit-cache/runtime
+```
+
+The eager-only BF16-state MTP acceptance test covers the ILP4 and general
+wide-vector dispatch families at `T=2`, including every checkpoint pool write:
+
+```shell
+RUSTFLAGS="-C target-cpu=native" \
+cargo run -p candle-flashinfer-gdn --bin bf16-state-mtp -- \
   /path/to/managed-env/bin/python \
   .cutedsl-jit-cache/runtime
 ```

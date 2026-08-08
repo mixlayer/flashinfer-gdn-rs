@@ -8,6 +8,7 @@
 
 use std::ffi::c_void;
 
+use candle::cuda_backend::cudarc::driver::sys::CUdevice_attribute;
 use candle::cuda_backend::cudarc::driver::{
     CudaStream as DriverStream, DevicePtr, DevicePtrMut, SyncOnDrop,
 };
@@ -15,12 +16,17 @@ use candle::cuda_backend::{CudaDevice, CudaStorage, CudaStorageSlice};
 use candle::{DType as CandleDType, Layout, Result, Storage, Tensor};
 use flashinfer_gdn::{CudaTensor, DType};
 
+mod bf16_state_decode;
+mod bf16_state_mtp;
 mod nontranspose_decode;
 mod pretranspose_decode;
 
+pub use bf16_state_decode::{Bf16StateDecodeInputs, Bf16StateDecodePlan};
+pub use bf16_state_mtp::{Bf16StateMtpInputs, Bf16StateMtpPlan};
 pub use flashinfer_gdn::{
-    DtBiasDType, InputDType, NontransposeDecodeBatchClass, NontransposeDecodeCompiler,
-    PretransposeDecodeCompiler,
+    Bf16StateDecodeCompiler, Bf16StateDecodeKernelVariant, Bf16StateMtpCompiler,
+    Bf16StateMtpKernelVariant, DtBiasDType, InputDType, NontransposeDecodeBatchClass,
+    NontransposeDecodeCompiler, PretransposeDecodeCompiler,
 };
 pub use nontranspose_decode::{NontransposeDecodeInputs, NontransposeDecodePlan};
 pub use pretranspose_decode::{PretransposeDecodeInputs, PretransposeDecodePlan};
@@ -212,6 +218,15 @@ fn device_architecture(device: &CudaDevice) -> Result<String> {
         )));
     }
     Ok(format!("sm_{major}{minor}a"))
+}
+
+fn device_multiprocessor_count(device: &CudaDevice) -> Result<usize> {
+    let count = device
+        .cuda_stream()
+        .context()
+        .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
+        .map_err(|error| message(format!("failed to query CUDA SM count: {error}")))?;
+    usize::try_from(count).map_err(|_| message(format!("invalid CUDA SM count {count}")))
 }
 
 fn core_error(error: flashinfer_gdn::Error) -> candle::Error {

@@ -11,18 +11,16 @@ from __future__ import annotations
 
 import argparse
 import ast
-import ctypes
-import hashlib
-import importlib.metadata
 import json
 import math
 import os
 from pathlib import Path
 import re
-import subprocess
 import sys
 import types
 from typing import Any
+
+from _artifact import finalize_artifact
 
 
 SCHEMA_VERSION = 1
@@ -41,14 +39,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--cc", default=os.environ.get("CC", "cc"))
     return parser.parse_args()
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _load_request(path: Path) -> dict[str, Any]:
@@ -175,50 +165,6 @@ def _load_flashinfer_kernel(source_file: Path, generated_source_file: Path) -> A
     if not hasattr(module, "run_gdn_decode_kernel_small_batch_pretranspose"):
         raise RuntimeError("kernel-only source did not define the expected JIT entrypoint")
     return module
-
-
-def _package_version(distribution: str) -> str:
-    return importlib.metadata.version(distribution)
-
-
-class _TvmFfiVersion(ctypes.Structure):
-    _fields_ = [
-        ("major", ctypes.c_uint32),
-        ("minor", ctypes.c_uint32),
-        ("patch", ctypes.c_uint32),
-    ]
-
-
-def _tvm_ffi_runtime_version(runtime_libraries: list[str]) -> str:
-    path = next(
-        Path(path).resolve()
-        for path in runtime_libraries
-        if Path(path).name == "libtvm_ffi.so"
-    )
-    library = ctypes.CDLL(str(path))
-    get_version = library.TVMFFIGetVersion
-    get_version.argtypes = [ctypes.POINTER(_TvmFfiVersion)]
-    get_version.restype = None
-    version = _TvmFfiVersion()
-    get_version(ctypes.byref(version))
-    return f"{version.major}.{version.minor}.{version.patch}"
-
-
-def _compiler_environment() -> dict[str, Any]:
-    marker = Path(sys.prefix) / "environment.json"
-    if not marker.is_file():
-        return {"managed": False}
-    with marker.open("rb") as stream:
-        metadata = json.load(stream)
-    digest = metadata.get("environment_digest")
-    if not isinstance(digest, str):
-        raise RuntimeError(f"managed environment marker has no digest: {marker}")
-    return {
-        "managed": True,
-        "environment_digest": digest,
-        "marker_sha256": _sha256(marker),
-        "packages": metadata.get("packages", {}),
-    }
 
 
 def _compile(request: dict[str, Any], source_file: Path, object_path: Path) -> list[str]:
@@ -352,16 +298,6 @@ def _compile(request: dict[str, Any], source_file: Path, object_path: Path) -> l
     return cutlass.runtime.find_runtime_libraries(enable_tvm_ffi=True)
 
 
-def _link(
-    cc: str, object_path: Path, module_path: Path, runtime_libraries: list[str]
-) -> list[str]:
-    command = [cc, "-shared", "-o", str(module_path), str(object_path)]
-    command.extend(str(Path(path).resolve()) for path in runtime_libraries)
-    command.append("-Wl,-z,defs")
-    subprocess.run(command, check=True)
-    return command
-
-
 def main() -> None:
     args = _parse_args()
     request_path = args.request.resolve(strict=True)
@@ -378,80 +314,24 @@ def main() -> None:
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     object_path = output_dir / "module.o"
-    module_path = output_dir / "module.so"
-    manifest_path = output_dir / "manifest.json"
 
     runtime_libraries = _compile(request, source_file, object_path)
-    link_command = _link(args.cc, object_path, module_path, runtime_libraries)
-    tvm_ffi_runtime_version = _tvm_ffi_runtime_version(runtime_libraries)
-
-    symbol = f"__tvm_ffi_{request['symbol']}"
-    nm = subprocess.run(
-        ["nm", "-D", "--defined-only", str(module_path)],
-        check=True,
-        text=True,
-        stdout=subprocess.PIPE,
-    ).stdout
-    if symbol not in nm:
-        raise RuntimeError(f"linked module does not export {symbol}")
-
-    manifest = {
-        "schema_version": SCHEMA_VERSION,
-        "abi": "tvm-ffi",
-        "entry_symbol": symbol,
-        "compiler_inputs": {
-            "shim": {"path": shim_path.name, "sha256": _sha256(shim_path)},
-            "request": {
-                "path": request_path.name,
-                "sha256": _sha256(request_path),
-            },
-        },
-        "flashinfer": {
-            "version": FLASHINFER_VERSION,
-            "git_rev": FLASHINFER_GIT_REV,
-            "source_file": str(ENTRY_FILE),
-            "source_sha256": _sha256(source_file),
-        },
-        "python": {
-            "implementation": sys.implementation.name,
-            "version": ".".join(str(part) for part in sys.version_info[:3]),
-        },
-        "packages": {
-            "apache-tvm-ffi": _package_version("apache-tvm-ffi"),
-            "cuda-python": _package_version("cuda-python"),
-            "nvidia-cutlass-dsl": _package_version("nvidia-cutlass-dsl"),
-        },
-        "compiler_environment": _compiler_environment(),
-        "tvm_ffi_runtime_version": tvm_ffi_runtime_version,
-        "torch_required": False,
-        "request": request,
-        "artifacts": {
-            "request": {
-                "path": request_path.name,
-                "sha256": _sha256(request_path),
-            },
-            "generated_source": {
-                "path": "kernel_source.py",
-                "sha256": _sha256(output_dir / "kernel_source.py"),
-            },
-            "object": {"path": object_path.name, "sha256": _sha256(object_path)},
-            "module": {"path": module_path.name, "sha256": _sha256(module_path)},
-        },
-        "runtime_libraries": [
-            {
-                "path": str(Path(path).resolve()),
-                "sha256": _sha256(Path(path).resolve()),
-            }
-            for path in runtime_libraries
-        ],
-        "link_command": link_command,
-    }
-    temporary_manifest = manifest_path.with_suffix(".json.tmp")
-    with temporary_manifest.open("w", encoding="utf-8") as stream:
-        json.dump(manifest, stream, indent=2, sort_keys=True)
-        stream.write("\n")
-    os.replace(temporary_manifest, manifest_path)
-    print(json.dumps({"manifest": str(manifest_path), "module": str(module_path)}))
+    finalize_artifact(
+        cc=args.cc,
+        request=request,
+        request_path=request_path,
+        shim_path=shim_path,
+        support_path=shim_path.with_name("_artifact.py"),
+        source_file=source_file,
+        entry_file=ENTRY_FILE,
+        output_dir=output_dir,
+        object_path=object_path,
+        runtime_libraries=runtime_libraries,
+        schema_version=SCHEMA_VERSION,
+        flashinfer_version=FLASHINFER_VERSION,
+        flashinfer_git_rev=FLASHINFER_GIT_REV,
+        torch_required=False,
+    )
 
 
 if __name__ == "__main__":
