@@ -3,14 +3,10 @@
 use std::env;
 use std::error::Error;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use candle::cuda_backend::cudarc::driver::sys::CUdevice_attribute;
 use candle::{DType, Device, Tensor};
-use candle_flashinfer_gdn::{DecodeInputs, DecodePlan};
-use flashinfer_gdn::{
-    Bf16StateDecodeCompiler, Bf16StateDecodeKernelVariant, Bf16StateDecodeSpecialization,
-};
+use candle_flashinfer_gdn::{DecodeInputs, GdnDecode, GdnDecodeConfig, GdnHandle};
 
 const H: usize = 1;
 const HV: usize = 1;
@@ -19,40 +15,19 @@ const V: usize = 128;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = env::args_os().skip(1);
-    let python = arguments.next().map(PathBuf::from).ok_or_else(usage)?;
-    let cache_root = arguments.next().map(PathBuf::from).ok_or_else(usage)?;
+    let cache_root = arguments.next().map(PathBuf::from);
     if arguments.next().is_some() {
         return Err(usage().into());
     }
+    let handle = match cache_root {
+        Some(cache_root) => GdnHandle::with_cache_root(cache_root)?,
+        None => GdnHandle::new()?,
+    };
 
     let device = Device::new_cuda_with_stream(0)?;
-    let cuda_device = device.as_cuda_device()?.clone();
-    let stream = cuda_device.cuda_stream();
-    let context = stream.context();
-    let (major, minor) = context.compute_capability()?;
-    let num_sms = usize::try_from(
-        context.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?,
-    )?;
-    let gpu_arch = format!("sm_{major}{minor}a");
-
-    let fallback = run_case(
-        2,
-        Bf16StateDecodeKernelVariant::Ilp4,
-        num_sms,
-        &python,
-        &cache_root,
-        &gpu_arch,
-        &device,
-    )?;
-    let wide = run_case(
-        512,
-        Bf16StateDecodeKernelVariant::WideVecT1,
-        num_sms,
-        &python,
-        &cache_root,
-        &gpu_arch,
-        &device,
-    )?;
+    let decode = GdnDecode::new(&handle, &device, GdnDecodeConfig::new(H, HV, K, V))?;
+    let fallback = run_case(2, &decode, &device)?;
+    let wide = run_case(512, &decode, &device)?;
     println!(
         "BF16-state decode passed: ILP4 output={:e}, state={:e}; wide output={:e}, state={:e}",
         fallback.0, fallback.1, wide.0, wide.1
@@ -60,29 +35,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_case(
     batch: usize,
-    expected_variant: Bf16StateDecodeKernelVariant,
-    num_sms: usize,
-    python: &Path,
-    cache_root: &Path,
-    gpu_arch: &str,
+    decode: &GdnDecode,
     device: &Device,
 ) -> Result<(f32, f32), Box<dyn Error>> {
-    let cuda_device = device.as_cuda_device()?.clone();
-    let specialization = Bf16StateDecodeSpecialization::new(gpu_arch, H, HV, K, V, batch, num_sms)?;
-    if specialization.variant != expected_variant {
-        return Err(io::Error::other(format!(
-            "batch {batch} selected {:?}, expected {expected_variant:?}",
-            specialization.variant
-        ))
-        .into());
-    }
-    let compiler = Bf16StateDecodeCompiler::from_managed_python(python, cache_root)?
-        .specialization(specialization)?;
-    let plan = DecodePlan::prepare(&compiler, &cuda_device, batch)?;
-
+    let x = Tensor::zeros((batch, 1), DType::BF16, device)?;
+    let plan = decode.prepare(&x)?;
     let pool_size = batch + 5;
     let pool_indices: Vec<usize> = (0..batch).map(|index| pool_size - 1 - index).collect();
     let device_indices: Vec<i32> = pool_indices
@@ -108,7 +67,7 @@ fn run_case(
     let (beta, beta_quantized) = bf16_tensor(beta_values, (batch, 1, HV), device)?;
     let state_indices = Tensor::from_vec(device_indices, batch, device)?;
 
-    let output = plan.forward(&DecodeInputs {
+    let inputs = DecodeInputs {
         state: &state,
         a_log: &a_log,
         a: &a,
@@ -119,7 +78,8 @@ fn run_case(
         beta: &beta,
         state_indices: &state_indices,
         checkpoint_indices: None,
-    })?;
+    };
+    let output = plan.forward(&inputs)?;
     device.synchronize()?;
 
     let (expected_output, expected_state) = reference(
@@ -149,7 +109,7 @@ fn run_case(
 }
 
 fn usage() -> io::Error {
-    io::Error::other("usage: bf16-state-decode <compiler-python> <cache-root>")
+    io::Error::other("usage: bf16-state-decode [cache-root]")
 }
 
 fn values(length: usize, amplitude: f32, phase: f32) -> Vec<f32> {

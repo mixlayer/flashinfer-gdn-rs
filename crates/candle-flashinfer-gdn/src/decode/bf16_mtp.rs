@@ -1,15 +1,17 @@
 use candle::cuda_backend::{CudaDevice, CudaStorage};
 use candle::{CpuStorage, DType as CandleDType, Device, InplaceOp1, Layout, Result, Tensor};
 use flashinfer_gdn::{
-    Bf16StateMtpCall, Bf16StateMtpCompiler as CoreCompiler, Bf16StateMtpPlan as CorePlan,
-    Bf16StateMtpSpecialization, CudaStream,
+    Bf16StateMtpCall, Bf16StateMtpPlan as CorePlan, Bf16StateMtpSpecialization, CudaStream,
 };
 
 use super::DecodeInputs;
 use crate::{
-    RawTensor, base_address, core_error, cuda_storage, descriptor, descriptor_parts,
-    device_architecture, ensure_ordinal, immutable_address, message, mutable_address,
-    state_pool::validate_indexed_state_pool, storage_dtype,
+    core_error, message,
+    raw_tensor::{
+        RawTensor, base_address, cuda_storage, descriptor, descriptor_parts, ensure_ordinal,
+        immutable_address, mutable_address, storage_dtype,
+    },
+    state_pool::validate_indexed_state_pool,
 };
 
 /// Prepared Candle adapter for BF16-state MTP and a fixed batch size.
@@ -22,30 +24,11 @@ pub(super) struct Plan {
 }
 
 impl Plan {
-    /// Compiles or loads the upstream-selected specialization and allocates auxiliaries.
-    pub fn prepare(compiler: &CoreCompiler, device: &CudaDevice, batch: usize) -> Result<Self> {
+    /// Binds a persistent loaded kernel and allocates a fresh plan auxiliary.
+    pub fn new(core: CorePlan, device: &CudaDevice, batch: usize) -> Result<Self> {
         if batch == 0 {
             return Err(message("MTP batch size must be positive"));
         }
-        let ordinal = device.cuda_stream().context().ordinal();
-        let device_id = i32::try_from(ordinal)
-            .map_err(|_| message(format!("CUDA ordinal does not fit i32: {ordinal}")))?;
-        let expected_arch = device_architecture(device)?;
-        let specialization = compiler.selected_specialization();
-        if specialization.gpu_arch != expected_arch {
-            return Err(message(format!(
-                "compiler specialization targets {}, but CUDA device {ordinal} requires {expected_arch}",
-                specialization.gpu_arch
-            )));
-        }
-        if !specialization.matches_runtime(batch).map_err(message)? {
-            return Err(message(format!(
-                "BF16-state MTP specialization {:?}/tile_v={} does not match upstream dispatch for batch {batch} and HV={}",
-                specialization.variant, specialization.tile_v, specialization.hv
-            )));
-        }
-
-        let core = CorePlan::prepare(compiler, device_id).map_err(core_error)?;
         let candle_device = Device::Cuda(device.clone());
         let accepted_steps = Tensor::zeros(batch, CandleDType::I32, &candle_device)?;
         Ok(Self {

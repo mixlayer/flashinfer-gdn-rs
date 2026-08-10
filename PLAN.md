@@ -71,11 +71,21 @@ items. The Rust layer validates tensor shapes, dtypes, contiguity, device identi
 and aliasing. Index values reside on the GPU; ownership and collision-free slot
 assignment remain responsibilities of the caller.
 
-The Candle crate exposes one `DecodeInputs` structure and one opaque `DecodePlan`.
-Passing a `Bf16StateDecodeCompiler` or `Bf16StateMtpCompiler` to
-`DecodePlan::prepare` selects the backend. `DecodePlan::forward` dispatches to the
-prepared backend. The only mode-specific input is optional `[B,T]`
-`checkpoint_indices`, which is required for MTP and ignored for `T=1`.
+The public integration exposes one reusable opaque `GdnHandle`, a model-owned
+`GdnDecode`, one `DecodeInputs` structure, and one opaque `DecodePlan`. The first
+handle lazily initializes a process-wide locked Python environment; handles own
+only the selected environment identity plus their artifact-cache, source-tree, and
+compiler-timeout configuration.
+
+`GdnDecode::new(&handle, &device, config)` records `H/HV/K/V`, captures the
+Candle CUDA device and stream, and queries the GPU architecture, device ordinal,
+and SM count once at model load. It also retains loaded modules by their effective
+specialization. `GdnDecode::prepare(&x)` reads `B/T` from the input tensor's leading
+two dimensions, selects `T=1` or MTP and the upstream variant internally, then
+allocates fresh plan-owned dummy tensors.
+`DecodePlan::forward` dispatches to the prepared backend. The only mode-specific
+input is optional `[B,T]` `checkpoint_indices`, which is required for MTP and
+ignored for `T=1`.
 
 ## `T=1` decode
 
@@ -181,29 +191,40 @@ against the pinned commit by default.
 
 ## Python dependencies
 
-Cargo build scripts do not run pip or mutate the invoking Python environment. The
-compiler environment is provisioned explicitly before preparing artifacts:
+Cargo build scripts do not run pip or mutate the invoking Python environment.
+`GdnHandle::new()` lazily locates, validates, or installs the locked compiler
+environment on first use and stores it in a process-wide singleton. It uses
+`CUTEDSL_JIT_CACHE_DIR`, then `$XDG_CACHE_HOME/cutedsl-jit`, then
+`$HOME/.cache/cutedsl-jit` for both environments and artifacts. Later handles reuse
+the selected interpreter and toolchain identity without rerunning the helper.
+`GdnHandle::with_cache_root` can override only the artifact-cache location.
+
+Production images may provision the same environment ahead of time:
 
 ```shell
 python3 crates/cutedsl-jit/python/prepare_environment.py \
-  --lock crates/flashinfer-gdn-sys/shims/requirements/cu13-aarch64-py312.lock \
-  --cache-root .cutedsl-jit-cache/compiler
+  --lock crates/flashinfer-gdn-sys/shims/requirements/cu13-aarch64-py312.lock
 ```
 
 The lock is binary-only, fully hashed, and does not install FlashInfer or PyTorch.
 It contains the CuTeDSL, TVM FFI, and CUDA Python packages needed by the compiler.
-Rust receives the resulting managed Python path and validates its immutable
-`environment.json` identity. Production images should prepare the environment and
-needed artifacts during provisioning rather than on a serving request.
+`CUTEDSL_JIT_PYTHON` selects a validated pre-provisioned interpreter;
+`CUTEDSL_JIT_BASE_PYTHON`, `CUTEDSL_JIT_CACHE_DIR`, `CUTEDSL_JIT_OFFLINE`, and
+`CUTEDSL_JIT_WHEELHOUSE` configure managed preparation. Production images should
+prepare the environment and needed artifacts during provisioning rather than on a
+serving request.
 
 ## CUDA Graph lifecycle
 
-Plans are created for a fixed batch before graph capture. Preparation may compile
-or load an artifact and allocates any auxiliary tensors. `forward` has no special
-preflight, warmup, or rebinding API; the application uses the same call in eager and
-capture execution. The surrounding graph owner is responsible for its normal
-warmup, stable tensor addresses, capture/replay, and any recurrent-state restoration
-required by its warmup policy.
+`GdnDecode` is created with the model and remains alive across forwards. Plans are
+created for fixed `B/T` before graph capture. The first effective specialization
+may compile or load an artifact; later plans reuse the loaded module. Every plan
+allocates and owns fresh batch-sized dummy tensors. `forward` has no special
+preflight, warmup, or rebinding API; the application uses the same call in eager
+and capture execution. A plan must remain alive as long as a captured graph can
+reference its auxiliaries. The surrounding graph owner remains responsible for its
+normal warmup, stable tensor addresses, capture/replay, and recurrent-state
+restoration required by its warmup policy.
 
 ## Verification and integration milestones
 

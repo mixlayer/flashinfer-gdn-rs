@@ -1,17 +1,14 @@
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
-use cutedsl_jit::{
-    Abi, Artifact, ArtifactCache, CacheKey, CompilerCommand, Error, Result, TvmFfiAny, TvmModule,
-};
+use cutedsl_jit::{Abi, Artifact, CacheKey, CompilerCommand, Error, Result, TvmFfiAny, TvmModule};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::json;
 
 use super::{
-    DlTensor, DtBiasDType, InputDType, absolute_path, host_compiler_identity,
-    managed_python_toolchain, source_root, valid_gpu_architecture, write_json,
+    DlTensor, DtBiasDType, GdnHandle, InputDType, host_compiler_identity, valid_gpu_architecture,
+    write_json,
 };
 
 /// Device implementation selected by FlashInfer's BF16-state T=1 dispatcher.
@@ -256,76 +253,15 @@ pub(super) fn packed_fma_for_architecture(architecture: &str) -> Result<bool> {
     Ok(numeric >= 100)
 }
 
-/// Compiler adapter for BF16-state, single-token decode.
-#[derive(Debug, Clone)]
-pub struct Bf16StateDecodeCompiler {
-    python: PathBuf,
-    cache: ArtifactCache,
-    toolchain: Value,
-    flashinfer_root: PathBuf,
-    timeout: Duration,
-    specialization: Bf16StateDecodeSpecialization,
-}
-
-impl Bf16StateDecodeCompiler {
-    /// Constructs an adapter with an explicit, path-independent toolchain identity.
-    pub fn new(
-        python: impl Into<PathBuf>,
-        cache_root: impl Into<PathBuf>,
-        toolchain: Value,
-    ) -> Result<Self> {
-        let python = absolute_path(python.into())?;
-        Ok(Self {
-            python,
-            cache: ArtifactCache::new(absolute_path(cache_root.into())?),
-            toolchain,
-            flashinfer_root: source_root().to_path_buf(),
-            timeout: Duration::from_secs(15 * 60),
-            specialization: Bf16StateDecodeSpecialization::default(),
-        })
-    }
-
-    /// Constructs an adapter from an environment created by `prepare_environment.py`.
-    pub fn from_managed_python(
-        python: impl Into<PathBuf>,
-        cache_root: impl Into<PathBuf>,
-    ) -> Result<Self> {
-        let (python, toolchain) = managed_python_toolchain(python.into())?;
-        Self::new(python, cache_root, toolchain)
-    }
-
-    /// Overrides the FlashInfer tree, primarily for source development.
-    #[must_use]
-    pub fn flashinfer_root(mut self, root: impl Into<PathBuf>) -> Self {
-        self.flashinfer_root = root.into();
-        self
-    }
-
-    /// Overrides the compiler-process timeout.
-    #[must_use]
-    pub fn timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
-        self
-    }
-
-    /// Selects the exact kernel specialization to prepare.
-    pub fn specialization(mut self, specialization: Bf16StateDecodeSpecialization) -> Result<Self> {
+impl GdnHandle {
+    /// Returns the content-addressed key for one `T=1` specialization.
+    pub fn bf16_state_decode_cache_key(
+        &self,
+        specialization: &Bf16StateDecodeSpecialization,
+    ) -> Result<CacheKey> {
         specialization.validate()?;
-        self.specialization = specialization;
-        Ok(self)
-    }
-
-    /// Selected specialization.
-    #[must_use]
-    pub fn selected_specialization(&self) -> &Bf16StateDecodeSpecialization {
-        &self.specialization
-    }
-
-    /// Returns the full content-addressed key without compiling.
-    pub fn cache_key(&self) -> Result<CacheKey> {
         let paths = compiler_paths();
-        self.specialization.validate()?;
-        let request = serde_json::to_value(&self.specialization).map_err(|error| {
+        let request = serde_json::to_value(specialization).map_err(|error| {
             Error::InvalidInput(format!(
                 "failed to serialize BF16-state decode request: {error}"
             ))
@@ -350,11 +286,14 @@ impl Bf16StateDecodeCompiler {
         )
     }
 
-    /// Returns a validated cache hit or compiles and atomically publishes a miss.
-    pub fn prepare(&self) -> Result<Artifact> {
+    /// Prepares one `T=1` artifact, compiling only on a cache miss.
+    pub fn prepare_bf16_state_decode(
+        &self,
+        specialization: &Bf16StateDecodeSpecialization,
+    ) -> Result<Artifact> {
         let paths = compiler_paths();
-        let key = self.cache_key()?;
-        let request = self.specialization.clone();
+        let key = self.bf16_state_decode_cache_key(specialization)?;
+        let request = specialization.clone();
         self.cache.get_or_build(&key, |directory| {
             let request_path = directory.join("request.json");
             write_json(&request_path, &request)?;
@@ -371,13 +310,16 @@ impl Bf16StateDecodeCompiler {
         })
     }
 
-    /// Explicitly prepares and dynamically loads the selected specialization.
-    pub fn load(&self) -> Result<Bf16StateDecodeKernel> {
-        let artifact = self.prepare()?;
+    /// Prepares and dynamically loads one `T=1` specialization.
+    pub fn load_bf16_state_decode(
+        &self,
+        specialization: &Bf16StateDecodeSpecialization,
+    ) -> Result<Bf16StateDecodeKernel> {
+        let artifact = self.prepare_bf16_state_decode(specialization)?;
         let module = TvmModule::load(artifact)?;
         Ok(Bf16StateDecodeKernel {
             module: Arc::new(module),
-            specialization: self.specialization.clone(),
+            specialization: specialization.clone(),
         })
     }
 }

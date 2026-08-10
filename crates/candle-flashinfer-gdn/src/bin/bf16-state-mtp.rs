@@ -3,11 +3,10 @@
 use std::env;
 use std::error::Error;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use candle::{DType, Device, Tensor};
-use candle_flashinfer_gdn::{DecodeInputs, DecodePlan};
-use flashinfer_gdn::{Bf16StateMtpCompiler, Bf16StateMtpKernelVariant, Bf16StateMtpSpecialization};
+use candle_flashinfer_gdn::{DecodeInputs, GdnDecode, GdnDecodeConfig, GdnHandle};
 
 const H: usize = 1;
 const HV: usize = 1;
@@ -17,35 +16,19 @@ const T: usize = 2;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = env::args_os().skip(1);
-    let python = arguments.next().map(PathBuf::from).ok_or_else(usage)?;
-    let cache_root = arguments.next().map(PathBuf::from).ok_or_else(usage)?;
+    let cache_root = arguments.next().map(PathBuf::from);
     if arguments.next().is_some() {
         return Err(usage().into());
     }
+    let handle = match cache_root {
+        Some(cache_root) => GdnHandle::with_cache_root(cache_root)?,
+        None => GdnHandle::new()?,
+    };
 
     let device = Device::new_cuda_with_stream(0)?;
-    let cuda_device = device.as_cuda_device()?.clone();
-    let stream = cuda_device.cuda_stream();
-    let context = stream.context();
-    let (major, minor) = context.compute_capability()?;
-    let gpu_arch = format!("sm_{major}{minor}a");
-
-    let fallback = run_case(
-        2,
-        Bf16StateMtpKernelVariant::Ilp4,
-        &python,
-        &cache_root,
-        &gpu_arch,
-        &device,
-    )?;
-    let wide = run_case(
-        128,
-        Bf16StateMtpKernelVariant::WideVec,
-        &python,
-        &cache_root,
-        &gpu_arch,
-        &device,
-    )?;
+    let decode = GdnDecode::new(&handle, &device, GdnDecodeConfig::new(H, HV, K, V))?;
+    let fallback = run_case(2, &decode, &device)?;
+    let wide = run_case(128, &decode, &device)?;
     println!(
         "BF16-state MTP checkpoints passed: ILP4 output={:e}, pool={:e}; wide output={:e}, pool={:e}",
         fallback.0, fallback.1, wide.0, wide.1
@@ -53,28 +36,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_case(
     batch: usize,
-    expected_variant: Bf16StateMtpKernelVariant,
-    python: &Path,
-    cache_root: &Path,
-    gpu_arch: &str,
+    decode: &GdnDecode,
     device: &Device,
 ) -> Result<(f32, f32), Box<dyn Error>> {
-    let cuda_device = device.as_cuda_device()?.clone();
-    let specialization = Bf16StateMtpSpecialization::new(gpu_arch, H, HV, K, V, T, batch)?;
-    if specialization.variant != expected_variant {
-        return Err(io::Error::other(format!(
-            "batch {batch} selected {:?}, expected {expected_variant:?}",
-            specialization.variant
-        ))
-        .into());
-    }
-    let compiler = Bf16StateMtpCompiler::from_managed_python(python, cache_root)?
-        .specialization(specialization)?;
-    let plan = DecodePlan::prepare(&compiler, &cuda_device, batch)?;
-
+    let x = Tensor::zeros((batch, T), DType::BF16, device)?;
+    let plan = decode.prepare(&x)?;
     let pool_size = batch * (T + 1) + 5;
     let pool_indices: Vec<usize> = (0..batch).map(|index| batch - 1 - index).collect();
     let checkpoint_indices: Vec<usize> = (0..batch)
@@ -109,7 +77,7 @@ fn run_case(
     let checkpoint_indices_tensor =
         Tensor::from_vec(device_checkpoint_indices, (batch, T), device)?;
 
-    let output = plan.forward(&DecodeInputs {
+    let inputs = DecodeInputs {
         state: &state,
         a_log: &a_log,
         a: &a,
@@ -120,7 +88,8 @@ fn run_case(
         beta: &beta,
         state_indices: &state_indices,
         checkpoint_indices: Some(&checkpoint_indices_tensor),
-    })?;
+    };
+    let output = plan.forward(&inputs)?;
     device.synchronize()?;
 
     let (expected_output, expected_state) = reference(
@@ -151,7 +120,7 @@ fn run_case(
 }
 
 fn usage() -> io::Error {
-    io::Error::other("usage: bf16-state-mtp <compiler-python> <cache-root>")
+    io::Error::other("usage: bf16-state-mtp [cache-root]")
 }
 
 fn values(length: usize, amplitude: f32, phase: f32) -> Vec<f32> {

@@ -16,8 +16,7 @@ pub use bf16_state_decode::{Bf16StateDecodeCall, Bf16StateDecodePlan, validate_b
 pub use bf16_state_mtp::{Bf16StateMtpCall, Bf16StateMtpPlan, validate_bf16_state_mtp};
 pub use error::{Error, Result};
 pub use flashinfer_gdn_sys::{
-    Bf16StateDecodeCompiler, Bf16StateDecodeKernelVariant, Bf16StateDecodeSpecialization,
-    Bf16StateMtpCompiler, Bf16StateMtpKernelVariant, Bf16StateMtpSpecialization, DtBiasDType,
-    InputDType,
+    Bf16StateDecodeKernelVariant, Bf16StateDecodeSpecialization, Bf16StateMtpKernelVariant,
+    Bf16StateMtpSpecialization, DtBiasDType, GdnHandle, InputDType,
 };
 pub use tensor::{CudaStream, CudaTensor, DType};

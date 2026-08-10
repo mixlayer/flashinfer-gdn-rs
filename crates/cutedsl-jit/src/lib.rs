@@ -9,6 +9,7 @@
 mod cache;
 mod command;
 mod digest;
+mod environment;
 mod error;
 mod model;
 mod tvm;
@@ -16,6 +17,7 @@ mod tvm_ffi;
 
 pub use cache::{Artifact, ArtifactCache};
 pub use command::CompilerCommand;
+pub use environment::{PythonEnvironment, default_cache_root, prepare_python_environment};
 pub use error::{Error, Result};
 pub use model::{
     ARTIFACT_MANIFEST_SCHEMA_VERSION, Abi, ArtifactFile, ArtifactManifest, CacheKey, HostIdentity,

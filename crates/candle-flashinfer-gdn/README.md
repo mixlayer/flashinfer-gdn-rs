@@ -35,9 +35,10 @@ active state.
 
 ## Dispatch
 
-Construct the appropriate specialization using the fixed runtime batch size before
-preparing its plan. `T` is part of the MTP specialization and artifact cache key.
-The Rust specialization reproduces the pinned upstream dispatch:
+`GdnDecode` records the CUDA device and `H/HV/K/V` model dimensions once.
+`GdnDecode::prepare(&x)` reads `B/T` from the input tensor's leading two dimensions,
+chooses single-token versus MTP, and reproduces the pinned upstream dispatch
+internally:
 
 - `T=1` uses ILP4 below `B*HV=512`, then the dedicated wide-vector kernel.
 - MTP uses ILP4 below `B*HV=128`, then the general wide-vector kernel.
@@ -47,15 +48,22 @@ plan is prepared.
 
 ## Lifecycle
 
-1. Create a `Bf16StateDecodeSpecialization` or `Bf16StateMtpSpecialization` for
-   the device architecture and fixed batch.
-2. Create the matching compiler and pass it to `DecodePlan::prepare` before CUDA
-   Graph capture. The compiler type selects the `T=1` or MTP backend. Preparation
-   compiles or loads the content-addressed artifact and allocates fixed auxiliary
-   tensors.
-3. Call `DecodePlan::forward` with `DecodeInputs` from eager code or a graph capture
+1. Create one `GdnHandle::new()`. It uses `CUTEDSL_JIT_CACHE_DIR`, then
+   `$XDG_CACHE_HOME/cutedsl-jit`, then `$HOME/.cache/cutedsl-jit`. The first handle
+   lazily resolves the process-wide locked Python environment; later handles reuse
+   it. Use `GdnHandle::with_cache_root` only when the artifact cache needs an
+   explicit location.
+2. At model load, create `GdnDecode::new(&handle, &device, config)`. It
+   captures the Candle CUDA device and queries its architecture, ordinal, and SM
+   count once. Loaded modules remain cached in this object.
+3. At the beginning of a model forward, call `GdnDecode::prepare(&x)` with an input
+   whose leading dimensions are `[B,T,...]`. The first effective specialization
+   compiles or loads its artifact; subsequent plans reuse the loaded module. Each
+   plan allocates fresh dummy tensors for its batch size.
+4. Call `DecodePlan::forward` with `DecodeInputs` from eager code or a graph capture
    body.
-4. Keep the plan and captured allocations alive for as long as the graph may run.
+5. Keep `GdnDecode` and the plan alive for as long as a captured graph may reference
+   the plan's auxiliary allocations.
 
 There is no GDN-specific warmup or tensor-binding phase. The surrounding graph
 runtime remains responsible for its normal eager warmup, capture, replay, and any
@@ -68,9 +76,7 @@ families with indexed pools:
 
 ```shell
 RUSTFLAGS="-C target-cpu=native" \
-cargo run -p candle-flashinfer-gdn --bin bf16-state-decode -- \
-  /path/to/managed-env/bin/python \
-  .cutedsl-jit-cache/runtime
+cargo run -p candle-flashinfer-gdn --bin bf16-state-decode
 ```
 
 The MTP executable covers both dispatch families at `T=2`, including every
@@ -78,9 +84,7 @@ checkpoint write:
 
 ```shell
 RUSTFLAGS="-C target-cpu=native" \
-cargo run -p candle-flashinfer-gdn --bin bf16-state-mtp -- \
-  /path/to/managed-env/bin/python \
-  .cutedsl-jit-cache/runtime
+cargo run -p candle-flashinfer-gdn --bin bf16-state-mtp
 ```
 
 The `target-cpu` setting is needed by the current Candle CPU GEMM dependency on the

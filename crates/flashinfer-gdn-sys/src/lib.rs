@@ -5,11 +5,15 @@
 //! GDN-specific argument schemas and `cutedsl-jit` modules. It intentionally does
 //! not depend on Candle.
 
-use std::fs::{self, File};
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
+use std::time::Duration;
 
-use cutedsl_jit::{Error, Result};
+use cutedsl_jit::{
+    ArtifactCache, Error, PythonEnvironment, Result, default_cache_root, prepare_python_environment,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -17,12 +21,11 @@ mod bf16_state_decode;
 mod bf16_state_mtp;
 
 pub use bf16_state_decode::{
-    Bf16StateDecodeCompiler, Bf16StateDecodeKernel, Bf16StateDecodeKernelVariant,
-    Bf16StateDecodeSpecialization, Bf16StateDecodeTensors,
+    Bf16StateDecodeKernel, Bf16StateDecodeKernelVariant, Bf16StateDecodeSpecialization,
+    Bf16StateDecodeTensors,
 };
 pub use bf16_state_mtp::{
-    Bf16StateMtpCompiler, Bf16StateMtpKernel, Bf16StateMtpKernelVariant,
-    Bf16StateMtpSpecialization, Bf16StateMtpTensors,
+    Bf16StateMtpKernel, Bf16StateMtpKernelVariant, Bf16StateMtpSpecialization, Bf16StateMtpTensors,
 };
 
 /// Error type shared with the generic artifact runtime.
@@ -40,6 +43,85 @@ pub const FLASHINFER_GIT_REV: &str = env!("FLASHINFER_GDN_GIT_REV");
 #[must_use]
 pub fn source_root() -> &'static Path {
     Path::new(env!("FLASHINFER_GDN_SOURCE_ROOT"))
+}
+
+/// Shared compiler and artifact-cache context for all GDN kernel families.
+///
+/// A handle is inexpensive to borrow and should normally be created once for a
+/// process, then reused to prepare every required specialization.
+#[derive(Debug, Clone)]
+pub struct GdnHandle {
+    pub(crate) python: PathBuf,
+    pub(crate) cache: ArtifactCache,
+    pub(crate) toolchain: Value,
+    pub(crate) flashinfer_root: PathBuf,
+    pub(crate) timeout: Duration,
+}
+
+static PYTHON_ENVIRONMENT: OnceLock<PythonEnvironment> = OnceLock::new();
+
+impl GdnHandle {
+    /// Creates a handle backed by the process-wide CuTeDSL Python environment.
+    ///
+    /// The first call locates, validates, or installs the locked environment.
+    /// Later calls reuse it without invoking the preparation helper.
+    pub fn new() -> Result<Self> {
+        Self::with_cache_root(default_cache_root()?)
+    }
+
+    /// Creates a handle with an explicit artifact-cache root.
+    ///
+    /// This does not change the process-wide Python environment cache; set
+    /// `CUTEDSL_JIT_CACHE_DIR` when both caches should use an explicit root.
+    pub fn with_cache_root(cache_root: impl Into<PathBuf>) -> Result<Self> {
+        let environment = python_environment()?;
+        Self::from_parts(
+            environment.python().to_path_buf(),
+            cache_root,
+            environment.identity().clone(),
+        )
+    }
+
+    fn from_parts(
+        python: impl Into<PathBuf>,
+        cache_root: impl Into<PathBuf>,
+        toolchain: Value,
+    ) -> Result<Self> {
+        Ok(Self {
+            python: absolute_path(python.into())?,
+            cache: ArtifactCache::new(absolute_path(cache_root.into())?),
+            toolchain,
+            flashinfer_root: source_root().to_path_buf(),
+            timeout: Duration::from_secs(15 * 60),
+        })
+    }
+
+    /// Overrides the FlashInfer source tree, primarily for source development.
+    #[must_use]
+    pub fn flashinfer_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.flashinfer_root = root.into();
+        self
+    }
+
+    /// Overrides the compiler-process timeout for all kernel families.
+    #[must_use]
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+}
+
+fn python_environment() -> Result<&'static PythonEnvironment> {
+    if let Some(environment) = PYTHON_ENVIRONMENT.get() {
+        return Ok(environment);
+    }
+    let lock =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("shims/requirements/cu13-aarch64-py312.lock");
+    let prepared = prepare_python_environment(lock)?;
+    let _ = PYTHON_ENVIRONMENT.set(prepared);
+    Ok(PYTHON_ENVIRONMENT
+        .get()
+        .expect("the Python environment was initialized above"))
 }
 
 /// Input element type compiled into a decode specialization.
@@ -95,55 +177,6 @@ fn absolute_path(path: PathBuf) -> Result<PathBuf> {
         })
 }
 
-fn read_json(path: &Path) -> Result<Value> {
-    let bytes = fs::read(path).map_err(|error| {
-        Error::InvalidInput(format!(
-            "failed to read JSON file {}: {error}",
-            path.display()
-        ))
-    })?;
-    serde_json::from_slice(&bytes).map_err(|error| {
-        Error::InvalidInput(format!(
-            "failed to parse JSON file {}: {error}",
-            path.display()
-        ))
-    })
-}
-
-fn managed_python_toolchain(python: PathBuf) -> Result<(PathBuf, Value)> {
-    let python = absolute_path(python)?;
-    let environment = python
-        .parent()
-        .and_then(Path::parent)
-        .ok_or_else(|| Error::InvalidInput("compiler Python has no environment root".into()))?;
-    let marker_path = environment.join("environment.json");
-    let marker = read_json(&marker_path)?;
-    let marker = marker.as_object().ok_or_else(|| {
-        Error::InvalidInput(format!(
-            "managed environment marker is not an object: {}",
-            marker_path.display()
-        ))
-    })?;
-    let required = |name: &str| {
-        marker.get(name).cloned().ok_or_else(|| {
-            Error::InvalidInput(format!(
-                "managed environment marker {} has no {name:?} field",
-                marker_path.display()
-            ))
-        })
-    };
-    // Absolute lock and runtime-library paths are deliberately excluded. The
-    // environment digest and exact package set identify the compiler without
-    // making equivalent environments in different cache roots miss.
-    let toolchain = json!({
-        "environment_schema_version": required("schema_version")?,
-        "environment_digest": required("environment_digest")?,
-        "python": required("python")?,
-        "packages": required("packages")?,
-    });
-    Ok((python, toolchain))
-}
-
 fn host_compiler_identity() -> Result<Value> {
     let program = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
     let output = Command::new(&program)
@@ -179,5 +212,28 @@ mod tests {
                 .join("flashinfer/gdn_kernels/gdn_decode_bf16_state.py")
                 .is_file()
         );
+    }
+
+    #[test]
+    fn one_handle_keys_both_decode_families() {
+        let handle = GdnHandle::from_parts(
+            "/unavailable-python-is-valid-for-key-generation",
+            "target/test-cutedsl-cache",
+            json!({"environment_digest": "test"}),
+        )
+        .unwrap();
+        let single = handle
+            .bf16_state_decode_cache_key(&Bf16StateDecodeSpecialization::default())
+            .unwrap();
+        let mtp = handle
+            .bf16_state_mtp_cache_key(&Bf16StateMtpSpecialization::default())
+            .unwrap();
+
+        assert_eq!(single.namespace, "flashinfer-gdn/decode-bf16-state-t1");
+        assert_eq!(
+            mtp.namespace,
+            "flashinfer-gdn/decode-bf16-state-mtp-pool-scatter"
+        );
+        assert_ne!(single.digest().unwrap(), mtp.digest().unwrap());
     }
 }

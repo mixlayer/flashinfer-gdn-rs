@@ -95,7 +95,7 @@ import cutlass.runtime
 
 names = json.loads(sys.argv[1])
 print(json.dumps({
-    "python": ".".join(str(part) for part in sys.version_info[:3]),
+    "python_version": ".".join(str(part) for part in sys.version_info[:3]),
     "packages": {name: importlib.metadata.version(name) for name in names},
     "runtime_libraries": cutlass.runtime.find_runtime_libraries(enable_tvm_ffi=True),
 }, sort_keys=True))
@@ -199,6 +199,7 @@ def main() -> None:
         print(
             json.dumps(
                 {
+                    "schema_version": ENVIRONMENT_SCHEMA_VERSION,
                     "managed": False,
                     "python": str(interpreter),
                     **probe,
@@ -248,6 +249,7 @@ def main() -> None:
     print(
         json.dumps(
             {
+                "schema_version": ENVIRONMENT_SCHEMA_VERSION,
                 "managed": True,
                 "environment": str(environment),
                 "environment_digest": digest,

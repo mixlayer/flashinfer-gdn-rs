@@ -1,15 +1,17 @@
 use candle::cuda_backend::{CudaDevice, CudaStorage};
 use candle::{CpuStorage, DType as CandleDType, Device, InplaceOp1, Layout, Result, Tensor};
 use flashinfer_gdn::{
-    Bf16StateDecodeCall, Bf16StateDecodeCompiler as CoreCompiler, Bf16StateDecodePlan as CorePlan,
-    Bf16StateDecodeSpecialization, CudaStream,
+    Bf16StateDecodeCall, Bf16StateDecodePlan as CorePlan, Bf16StateDecodeSpecialization, CudaStream,
 };
 
 use super::DecodeInputs;
 use crate::{
-    RawTensor, base_address, core_error, cuda_storage, descriptor, descriptor_parts,
-    device_architecture, device_multiprocessor_count, ensure_ordinal, immutable_address, message,
-    mutable_address, state_pool::validate_indexed_state_pool, storage_dtype,
+    core_error, message,
+    raw_tensor::{
+        RawTensor, base_address, cuda_storage, descriptor, descriptor_parts, ensure_ordinal,
+        immutable_address, mutable_address, storage_dtype,
+    },
+    state_pool::validate_indexed_state_pool,
 };
 
 /// Prepared Candle adapter for BF16-state T=1 decode and a fixed batch size.
@@ -23,34 +25,11 @@ pub(super) struct Plan {
 }
 
 impl Plan {
-    /// Compiles or loads the upstream-selected specialization and allocates auxiliaries.
-    pub fn prepare(compiler: &CoreCompiler, device: &CudaDevice, batch: usize) -> Result<Self> {
+    /// Binds a persistent loaded kernel and allocates fresh plan auxiliaries.
+    pub fn new(core: CorePlan, device: &CudaDevice, batch: usize) -> Result<Self> {
         if batch == 0 {
             return Err(message("decode batch size must be positive"));
         }
-        let ordinal = device.cuda_stream().context().ordinal();
-        let device_id = i32::try_from(ordinal)
-            .map_err(|_| message(format!("CUDA ordinal does not fit i32: {ordinal}")))?;
-        let expected_arch = device_architecture(device)?;
-        let specialization = compiler.selected_specialization();
-        if specialization.gpu_arch != expected_arch {
-            return Err(message(format!(
-                "compiler specialization targets {}, but CUDA device {ordinal} requires {expected_arch}",
-                specialization.gpu_arch
-            )));
-        }
-        let num_sms = device_multiprocessor_count(device)?;
-        if !specialization
-            .matches_runtime(batch, num_sms)
-            .map_err(message)?
-        {
-            return Err(message(format!(
-                "BF16-state specialization {:?}/tile_v={} does not match upstream dispatch for batch {batch}, HV={}, and {num_sms} SMs",
-                specialization.variant, specialization.tile_v, specialization.hv
-            )));
-        }
-
-        let core = CorePlan::prepare(compiler, device_id).map_err(core_error)?;
         let candle_device = Device::Cuda(device.clone());
         let accepted_steps = Tensor::zeros(batch, CandleDType::I32, &candle_device)?;
         let ssm_state_indices = Tensor::zeros((batch, 1), CandleDType::I32, &candle_device)?;

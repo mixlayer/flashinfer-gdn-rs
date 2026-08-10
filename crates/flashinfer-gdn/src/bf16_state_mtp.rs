@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use flashinfer_gdn_sys::{
-    Bf16StateMtpCompiler, Bf16StateMtpKernel, Bf16StateMtpSpecialization, Bf16StateMtpTensors,
+    Bf16StateMtpKernel, Bf16StateMtpSpecialization, Bf16StateMtpTensors, GdnHandle,
 };
 
 use crate::tensor::DlTensorOwner;
@@ -57,14 +57,18 @@ pub struct Bf16StateMtpPlan {
 
 impl Bf16StateMtpPlan {
     /// Compiles or loads the selected specialization.
-    pub fn prepare(compiler: &Bf16StateMtpCompiler, device_id: i32) -> Result<Self> {
+    pub fn prepare(
+        handle: &GdnHandle,
+        specialization: &Bf16StateMtpSpecialization,
+        device_id: i32,
+    ) -> Result<Self> {
         if device_id < 0 {
             return Err(Error::tensor(
                 "plan",
                 format!("negative CUDA device id {device_id}"),
             ));
         }
-        let kernel = compiler.load()?;
+        let kernel = handle.load_bf16_state_mtp(specialization)?;
         Self::from_kernel(kernel, device_id)
     }
 
