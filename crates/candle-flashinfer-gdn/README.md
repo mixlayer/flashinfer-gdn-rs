@@ -3,7 +3,8 @@
 Candle integration for the prepared FlashInfer GDN kernels in this workspace. The
 supported `T=1` decode operations are:
 
-- BF16-input, float-state pretransposed `[B,HV,V,K]` direct state or indexed pools;
+- BF16-input, float-state pretransposed `[P,HV,V,K]` pools selected by int32 `[B]`
+  indices;
 - BF16-input, float-state non-transposed `[P,HV,K,V]` compact pools selected by
   int32 `[B]` indices; and
 - BF16-input, BF16-state `[P,HV,V,K]` compact pools selected and updated in the same
@@ -14,8 +15,17 @@ supported `T=1` decode operations are:
 Non-transposed decode compiles distinct small- (`B<32`) and large-batch (`B>=32`)
 artifacts. Construct its specialization with the same fixed batch passed to
 `NontransposeDecodePlan::prepare`.
-The pool is passed directly to the kernel; the adapter does not gather a temporary
-batch-sized state tensor.
+
+Every Candle operation presents the same persistent-pool interface: `state` is a
+compact pool and `state_indices` selects one input state per batch item. Backends
+with native pool indexing receive those tensors directly. Backends with compact
+per-batch state contracts use a graph-stable plan-owned workspace and enqueue a
+device gather, the FlashInfer kernel, and a device scatter on the same CUDA stream.
+Pretranspose selects between those paths from its specialization; nontranspose uses
+the fallback because FlashInfer's public nontranspose API is compact-state only.
+Both float-state decode adapters accept optional `[B]` write indices, defaulting to
+the read indices.
+Pool indices must be nonnegative, in range, and unique within a concurrent write.
 
 BF16-state decode fixes `K=V=128` and compiles the upstream ILP4 or wide-vector
 implementation selected from `B*HV` and the device SM count. Its state pool must be
@@ -47,9 +57,9 @@ capture. `modeld-core` already does both and calls the graph module eagerly befo
 capture. Graph owners are also responsible for restoring recurrent state if their
 warmup policy requires it.
 
-The deterministic GPU acceptance executable exercises numerical comparison,
-direct and indexed state, changed input contents, repeated graph replay, and a
-second CUDA stream:
+The deterministic GPU acceptance executable exercises numerical comparison for the
+compact-backend fallback and native indexing, changed input contents, repeated
+graph replay, and a second CUDA stream:
 
 ```shell
 RUSTFLAGS="-C target-cpu=native" \

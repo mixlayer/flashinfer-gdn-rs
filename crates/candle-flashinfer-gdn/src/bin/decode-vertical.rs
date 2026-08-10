@@ -52,6 +52,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let beta_values = vec![-0.2, 0.3];
 
     let state = Tensor::from_vec(initial_state.clone(), (BATCH, HV, V, K), &candle_device)?;
+    let direct_indices = Tensor::from_vec(vec![0_i32, 1], BATCH, &candle_device)?;
     let a_log = Tensor::from_vec(a_log_values.clone(), HV, &candle_device)?;
     let (a, a_quantized) = bf16_tensor(a_values, (BATCH, 1, HV), &candle_device)?;
     let dt_bias = Tensor::from_vec(dt_bias_values.clone(), HV, &candle_device)?;
@@ -68,7 +69,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         k: &k,
         v: &v,
         beta: &beta,
-        state_indices: None,
+        state_indices: &direct_indices,
         output_state_indices: None,
     };
 
@@ -173,7 +174,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         k: &k,
         v: &v,
         beta: &beta,
-        state_indices: Some(&read_indices),
+        state_indices: &read_indices,
         output_state_indices: Some(&write_indices),
     };
     drop(pool_plan.forward(&pool_inputs)?);
@@ -247,7 +248,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         k: &k,
         v: &v,
         beta: &beta,
-        state_indices: None,
+        state_indices: &direct_indices,
         output_state_indices: None,
     };
     let second_output = second_plan.forward(&second_inputs)?;

@@ -9,9 +9,9 @@ use crate::decode::{bounds_overlap, check_rank, checked_mul, expect};
 use crate::tensor::DlTensorOwner;
 use crate::{CudaStream, CudaTensor, DType, Error, Result};
 
-/// Tensor arguments for one indexed-pool non-transposed decode launch.
+/// Tensor arguments for one compact-state non-transposed decode launch.
 pub struct NontransposeDecodeCall<'a> {
-    /// Main K-major state pool `[P,HV,K,V]`, float32 and updated in place.
+    /// Compact K-major state `[B,HV,K,V]`, float32 and updated in place.
     pub state: &'a mut CudaTensor,
     /// Log-decay parameter `[HV]`, float32.
     pub a_log: &'a CudaTensor,
@@ -29,10 +29,7 @@ pub struct NontransposeDecodeCall<'a> {
     pub beta: &'a CudaTensor,
     /// BF16 output `[B,1,HV,V]`, written in place.
     pub output: &'a mut CudaTensor,
-    /// Pool indices `[B]`, int32.
-    ///
-    /// Entries must be in `[0,P)` and concurrent batch entries must not select the
-    /// same slot. Values live on the GPU and are not synchronized back for checking.
+    /// Identity indices `[B]`, int32, retained by the upstream kernel ABI.
     pub state_indices: &'a CudaTensor,
     /// Zero-filled `[B+1]` int32 auxiliary reserved by the upstream ABI.
     pub cu_seqlens: &'a CudaTensor,
@@ -93,9 +90,9 @@ impl NontransposeDecodePlan {
         validate_nontranspose_decode_for_device(self.specialization(), self.inner.device_id, call)?;
 
         let specialization = self.specialization();
-        let pool_size = call.state.shape()[0];
+        let batch = call.q.shape()[0];
         let mut state_shape = [
-            checked_mul(pool_size, specialization.hv as i64, "P*HV")?,
+            checked_mul(batch, specialization.hv as i64, "B*HV")?,
             specialization.k as i64,
             specialization.v as i64,
         ];
@@ -214,18 +211,17 @@ fn validate_nontranspose_decode_for_device(
         device_id,
     )?;
     check_rank(call.state, "state", 4)?;
-    let pool_size = call.state.shape()[0];
     expect(
         call.state,
         "state",
         DType::F32,
-        &[pool_size, hv, k, v],
+        &[batch, hv, k, v],
         device_id,
     )?;
     if !call.state.is_contiguous() {
         return Err(Error::tensor(
             "state",
-            "non-transposed state pool must be compact row-major [P,HV,K,V]",
+            "non-transposed state must be compact row-major [B,HV,K,V]",
         ));
     }
 
@@ -330,7 +326,7 @@ mod tests {
             128,
             specialization_batch,
         )?;
-        let mut state = tensor(DType::F32, &[batch + 3, 16, 128, 128], 0);
+        let mut state = tensor(DType::F32, &[batch, 16, 128, 128], 0);
         let a_log = tensor(DType::F32, &[16], 1);
         let a = tensor(DType::BF16, &[batch, 1, 16], 2);
         let dt_bias = tensor(DType::F32, &[16], 3);
@@ -360,7 +356,7 @@ mod tests {
     }
 
     #[test]
-    fn validates_indexed_pool_non_transposed_contract() {
+    fn validates_compact_non_transposed_contract() {
         validate(2, 2).unwrap();
     }
 

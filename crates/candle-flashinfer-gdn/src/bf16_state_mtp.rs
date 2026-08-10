@@ -8,7 +8,7 @@ use flashinfer_gdn::{
 use crate::{
     RawTensor, base_address, core_error, cuda_storage, descriptor, descriptor_parts,
     device_architecture, ensure_ordinal, immutable_address, message, mutable_address,
-    storage_dtype,
+    state_pool::validate_indexed_state_pool, storage_dtype,
 };
 
 /// Candle tensors consumed by checkpointed BF16-state MTP.
@@ -110,6 +110,14 @@ impl Bf16StateMtpPlan {
 
     /// Runs BF16-state MTP and returns `[B,T,HV,V]` BF16 output.
     pub fn forward(&self, inputs: &Bf16StateMtpInputs<'_>) -> Result<Tensor> {
+        let spec = self.specialization();
+        validate_indexed_state_pool(
+            inputs.state,
+            inputs.state_indices,
+            CandleDType::BF16,
+            &[spec.hv, spec.v, spec.k],
+            self.batch,
+        )?;
         let output = self.empty_output()?;
         self.validate_mutable_aliases(inputs, &output)?;
         inputs.state.inplace_op1(&StateLaunch {

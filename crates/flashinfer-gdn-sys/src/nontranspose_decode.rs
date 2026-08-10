@@ -382,7 +382,7 @@ pub struct NontransposeDecodeTensors<'a> {
     pub a_log: &'a mut DlTensor,
     /// Decay bias `[HV]`.
     pub dt_bias: &'a mut DlTensor,
-    /// Main state pool flattened to `[P*HV,K,V]`.
+    /// Compact per-batch state flattened to `[B*HV,K,V]`.
     pub state: &'a mut DlTensor,
     /// Identity state indices `[B]`.
     pub state_indices: &'a mut DlTensor,

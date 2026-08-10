@@ -7,7 +7,9 @@ use flashinfer_gdn::{
 
 use crate::{
     RawTensor, base_address, core_error, cuda_storage, descriptor, descriptor_parts,
-    device_architecture, ensure_ordinal, immutable_address, message, mutable_address,
+    device_architecture, effective_address, ensure_ordinal, immutable_address, message,
+    mutable_address,
+    state_pool::{IndexedStateWorkspace, validate_indexed_state_pool, validate_state_indices},
     storage_dtype,
 };
 
@@ -34,6 +36,8 @@ pub struct NontransposeDecodeInputs<'a> {
     pub beta: &'a Tensor,
     /// Int32 `[B]` state-pool indices.
     pub state_indices: &'a Tensor,
+    /// Optional int32 `[B]` write indices. Defaults to `state_indices`.
+    pub output_state_indices: Option<&'a Tensor>,
 }
 
 /// Prepared Candle adapter for one specialization and fixed decode batch size.
@@ -42,7 +46,9 @@ pub struct NontransposeDecodePlan {
     core: CorePlan,
     device: CudaDevice,
     batch: usize,
+    identity_state_indices: Tensor,
     cu_seqlens: Tensor,
+    state_workspace: IndexedStateWorkspace,
 }
 
 impl NontransposeDecodePlan {
@@ -71,12 +77,23 @@ impl NontransposeDecodePlan {
         }
         let core = CorePlan::prepare(compiler, device_id).map_err(core_error)?;
         let candle_device = Device::Cuda(device.clone());
+        let batch_i32 = i32::try_from(batch)
+            .map_err(|_| message(format!("decode batch does not fit i32: {batch}")))?;
+        let identity_state_indices = Tensor::arange(0_i32, batch_i32, &candle_device)?;
         let cu_seqlens = Tensor::zeros(batch + 1, CandleDType::I32, &candle_device)?;
+        let state_workspace = IndexedStateWorkspace::new(
+            device,
+            batch,
+            &[specialization.hv, specialization.k, specialization.v],
+            CandleDType::F32,
+        )?;
         Ok(Self {
             core,
             device: device.clone(),
             batch,
+            identity_state_indices,
             cu_seqlens,
+            state_workspace,
         })
     }
 
@@ -109,18 +126,37 @@ impl NontransposeDecodePlan {
 
     /// Runs non-transposed GDN decode and returns the BF16 output.
     pub fn forward(&self, inputs: &NontransposeDecodeInputs<'_>) -> Result<Tensor> {
+        self.validate_pool_contract(inputs)?;
         let output = self.empty_output()?;
         self.execute(inputs, &output)?;
         Ok(output)
     }
 
     fn execute(&self, inputs: &NontransposeDecodeInputs<'_>, output: &Tensor) -> Result<()> {
-        self.validate_mutable_aliases(inputs, output)?;
+        let output_state_indices = inputs.output_state_indices.unwrap_or(inputs.state_indices);
+        self.validate_mutable_aliases(inputs, output, output_state_indices)?;
         inputs.state.inplace_op1(&StateLaunch {
             plan: self,
             inputs,
             output,
+            output_state_indices,
         })
+    }
+
+    fn validate_pool_contract(&self, inputs: &NontransposeDecodeInputs<'_>) -> Result<()> {
+        let spec = self.specialization();
+        validate_indexed_state_pool(
+            inputs.state,
+            inputs.state_indices,
+            CandleDType::F32,
+            &[spec.hv, spec.k, spec.v],
+            self.batch,
+        )?;
+        validate_state_indices(
+            inputs.output_state_indices.unwrap_or(inputs.state_indices),
+            self.batch,
+            "output_state_indices",
+        )
     }
 
     // This prevents recursively locking an aliased Candle allocation at the FFI boundary.
@@ -128,6 +164,7 @@ impl NontransposeDecodePlan {
         &self,
         inputs: &NontransposeDecodeInputs<'_>,
         output: &Tensor,
+        output_state_indices: &Tensor,
     ) -> Result<()> {
         let stream = self.device.cuda_stream();
         let state = base_address(inputs.state, &stream, "state")?;
@@ -144,6 +181,8 @@ impl NontransposeDecodePlan {
             ("v", inputs.v),
             ("beta", inputs.beta),
             ("state_indices", inputs.state_indices),
+            ("output_state_indices", output_state_indices),
+            ("identity_state_indices", &self.identity_state_indices),
             ("cu_seqlens", &self.cu_seqlens),
         ] {
             let address = base_address(tensor, &stream, name)?;
@@ -166,6 +205,7 @@ struct StateLaunch<'a> {
     plan: &'a NontransposeDecodePlan,
     inputs: &'a NontransposeDecodeInputs<'a>,
     output: &'a Tensor,
+    output_state_indices: &'a Tensor,
 }
 
 impl InplaceOp1 for StateLaunch<'_> {
@@ -182,25 +222,107 @@ impl InplaceOp1 for StateLaunch<'_> {
         let state_dtype = storage_dtype(storage)?;
         let stream = self.plan.device.cuda_stream();
         let (state_ptr, _state_use) = mutable_address(storage, &stream)?;
-        self.output.inplace_op1(&OutputLaunch {
-            parent: self,
-            state: RawTensor::new(
-                state_ptr,
-                state_dtype,
-                layout,
-                self.plan.core.device_id(),
-                "state",
-            )?,
-        })
+        self.plan
+            .state_workspace
+            .compact()
+            .inplace_op1(&CompactStateLaunch {
+                parent: self,
+                pool: RawTensor::new(
+                    state_ptr,
+                    state_dtype,
+                    layout,
+                    self.plan.core.device_id(),
+                    "state",
+                )?,
+            })
     }
 }
 
-struct OutputLaunch<'a, 'b> {
+struct CompactStateLaunch<'a, 'b> {
     parent: &'a StateLaunch<'b>,
+    pool: RawTensor,
+}
+
+impl InplaceOp1 for CompactStateLaunch<'_, '_> {
+    fn name(&self) -> &'static str {
+        "flashinfer-gdn-nontranspose-decode-compact-state"
+    }
+
+    fn cpu_fwd(&self, _storage: &mut CpuStorage, _layout: &Layout) -> Result<()> {
+        Err(message("FlashInfer GDN decode requires CUDA storage"))
+    }
+
+    fn cuda_fwd(&self, storage: &mut CudaStorage, layout: &Layout) -> Result<()> {
+        let plan = self.parent.plan;
+        ensure_ordinal(storage, plan.core.device_id(), "compact_state")?;
+        let compact_dtype = storage_dtype(storage)?;
+        let stream = plan.device.cuda_stream();
+        let (compact_ptr, _compact_use) = mutable_address(storage, &stream)?;
+
+        let (indices_storage, indices_layout) =
+            self.parent.inputs.state_indices.storage_and_layout();
+        let (output_indices_storage, output_indices_layout) =
+            self.parent.output_state_indices.storage_and_layout();
+        let indices_storage = cuda_storage(&indices_storage, "state_indices")?;
+        let output_indices_storage = cuda_storage(&output_indices_storage, "output_state_indices")?;
+        ensure_ordinal(indices_storage, plan.core.device_id(), "state_indices")?;
+        ensure_ordinal(
+            output_indices_storage,
+            plan.core.device_id(),
+            "output_state_indices",
+        )?;
+        let (indices_ptr, _indices_use) = immutable_address(indices_storage, &stream)?;
+        let (output_indices_ptr, _output_indices_use) =
+            immutable_address(output_indices_storage, &stream)?;
+
+        let pool = self.pool.effective_address("state")?;
+        let indices = effective_address(
+            indices_ptr,
+            storage_dtype(indices_storage)?,
+            indices_layout,
+            "state_indices",
+        )?;
+        let output_indices = effective_address(
+            output_indices_ptr,
+            storage_dtype(output_indices_storage)?,
+            output_indices_layout,
+            "output_state_indices",
+        )?;
+        let compact = effective_address(compact_ptr, compact_dtype, layout, "compact_state")?;
+        // SAFETY: the surrounding Candle guards keep all three allocations live and
+        // validation fixes their shapes, dtypes, and device.
+        unsafe {
+            plan.state_workspace
+                .gather(&stream, pool, indices, compact)?;
+        }
+
+        self.parent.output.inplace_op1(&OutputLaunch {
+            parent: self,
+            state: RawTensor::new(
+                compact_ptr,
+                compact_dtype,
+                layout,
+                plan.core.device_id(),
+                "compact_state",
+            )?,
+        })?;
+
+        // SAFETY: the same guards remain live, and the FlashInfer launch above is
+        // ordered before this writeback on the same stream.
+        unsafe {
+            plan.state_workspace
+                .scatter(&stream, compact, output_indices, pool)?;
+        }
+        Ok(())
+    }
+}
+
+struct OutputLaunch<'a, 'b, 'c> {
+    parent: &'a CompactStateLaunch<'b, 'c>,
     state: RawTensor,
 }
 
-impl InplaceOp1 for OutputLaunch<'_, '_> {
+impl InplaceOp1 for OutputLaunch<'_, '_, '_> {
     fn name(&self) -> &'static str {
         "flashinfer-gdn-nontranspose-decode-output"
     }
@@ -211,21 +333,22 @@ impl InplaceOp1 for OutputLaunch<'_, '_> {
 
     #[allow(clippy::too_many_lines)]
     fn cuda_fwd(&self, output_storage: &mut CudaStorage, output_layout: &Layout) -> Result<()> {
-        let plan = self.parent.plan;
+        let plan = self.parent.parent.plan;
         ensure_ordinal(output_storage, plan.core.device_id(), "output")?;
         let output_dtype = storage_dtype(output_storage)?;
         let stream = plan.device.cuda_stream();
         let (output_ptr, _output_use) = mutable_address(output_storage, &stream)?;
 
-        let (a_log_storage, a_log_layout) = self.parent.inputs.a_log.storage_and_layout();
-        let (a_storage, a_layout) = self.parent.inputs.a.storage_and_layout();
-        let (dt_bias_storage, dt_bias_layout) = self.parent.inputs.dt_bias.storage_and_layout();
-        let (q_storage, q_layout) = self.parent.inputs.q.storage_and_layout();
-        let (k_storage, k_layout) = self.parent.inputs.k.storage_and_layout();
-        let (v_storage, v_layout) = self.parent.inputs.v.storage_and_layout();
-        let (beta_storage, beta_layout) = self.parent.inputs.beta.storage_and_layout();
+        let inputs = self.parent.parent.inputs;
+        let (a_log_storage, a_log_layout) = inputs.a_log.storage_and_layout();
+        let (a_storage, a_layout) = inputs.a.storage_and_layout();
+        let (dt_bias_storage, dt_bias_layout) = inputs.dt_bias.storage_and_layout();
+        let (q_storage, q_layout) = inputs.q.storage_and_layout();
+        let (k_storage, k_layout) = inputs.k.storage_and_layout();
+        let (v_storage, v_layout) = inputs.v.storage_and_layout();
+        let (beta_storage, beta_layout) = inputs.beta.storage_and_layout();
         let (state_indices_storage, state_indices_layout) =
-            self.parent.inputs.state_indices.storage_and_layout();
+            plan.identity_state_indices.storage_and_layout();
         let (cu_seqlens_storage, cu_seqlens_layout) = plan.cu_seqlens.storage_and_layout();
 
         let a_log_storage = cuda_storage(&a_log_storage, "a_log")?;
@@ -235,7 +358,7 @@ impl InplaceOp1 for OutputLaunch<'_, '_> {
         let k_storage = cuda_storage(&k_storage, "k")?;
         let v_storage = cuda_storage(&v_storage, "v")?;
         let beta_storage = cuda_storage(&beta_storage, "beta")?;
-        let state_indices_storage = cuda_storage(&state_indices_storage, "state_indices")?;
+        let state_indices_storage = cuda_storage(&state_indices_storage, "identity_state_indices")?;
         let cu_seqlens_storage = cuda_storage(&cu_seqlens_storage, "cu_seqlens")?;
 
         for (name, storage) in [
@@ -246,7 +369,7 @@ impl InplaceOp1 for OutputLaunch<'_, '_> {
             ("k", k_storage),
             ("v", v_storage),
             ("beta", beta_storage),
-            ("state_indices", state_indices_storage),
+            ("identity_state_indices", state_indices_storage),
             ("cu_seqlens", cu_seqlens_storage),
         ] {
             ensure_ordinal(storage, plan.core.device_id(), name)?;
@@ -282,7 +405,7 @@ impl InplaceOp1 for OutputLaunch<'_, '_> {
             state_indices_ptr,
             state_indices_storage,
             state_indices_layout,
-            "state_indices",
+            "identity_state_indices",
         )?;
         let cu_seqlens = descriptor(
             cu_seqlens_ptr,

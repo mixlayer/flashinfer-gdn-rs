@@ -110,50 +110,8 @@ def _load_request(path: Path) -> dict[str, Any]:
     return request
 
 
-def _adapt_pool_launch_grid(selected_nodes: list[ast.stmt]) -> None:
-    """Make the two launch JITs derive work from indices rather than pool capacity.
-
-    Upstream's public helper passes a direct ``[B*HV,K,V]`` state and therefore
-    aliases its first dimension to the amount of launch work. A persistent pool is
-    ``[P*HV,K,V]`` instead. The device kernels already index it correctly through
-    ``h0_indices``; only the launch-grid calculation needs to use ``B*HV``.
-    """
-    function_names = {
-        "run_gdn_decode_kernel_small_batch_nontranspose",
-        "run_gdn_decode_kernel_big_batch_nontranspose",
-    }
-    transformed: set[str] = set()
-    replacement = ast.parse("h0_indices.layout.shape[0] * HV", mode="eval").body
-    for statement in selected_nodes:
-        if not isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        if statement.name not in function_names:
-            continue
-        matches = [
-            node
-            for node in ast.walk(statement)
-            if isinstance(node, ast.Assign)
-            and len(node.targets) == 1
-            and isinstance(node.targets[0], ast.Name)
-            and node.targets[0].id == "batch_size"
-            and isinstance(node.value, ast.Name)
-            and node.value.id == "batch_hv_dim"
-        ]
-        if len(matches) != 1:
-            raise RuntimeError(
-                f"expected one direct-state grid assignment in {statement.name}, "
-                f"found {len(matches)}"
-            )
-        matches[0].value = replacement
-        transformed.add(statement.name)
-    if transformed != function_names:
-        raise RuntimeError(
-            "pinned source no longer exposes both expected non-transposed launch JITs"
-        )
-
-
 def _load_flashinfer_kernel(source_file: Path, generated_source_file: Path) -> Any:
-    """Load a checked, Torch-free projection with a pool-aware launch grid."""
+    """Load a checked, Torch-free projection of the upstream kernel source."""
     module_name = "_flashinfer_gdn_decode_nontranspose_v0_6_16_post2"
     source = source_file.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(source_file))
@@ -184,8 +142,6 @@ def _load_flashinfer_kernel(source_file: Path, generated_source_file: Path) -> A
         for node in ast.walk(statement)
     ):
         raise RuntimeError("kernel-only source prefix unexpectedly references torch")
-
-    _adapt_pool_launch_grid(selected_nodes)
 
     kernel_tree = ast.Module(body=selected_nodes, type_ignores=[])
     generated_source = ast.unparse(ast.fix_missing_locations(kernel_tree)) + "\n"
@@ -235,7 +191,7 @@ def _compile(request: dict[str, Any], source_file: Path, object_path: Path) -> l
     v = request["v"]
     t = request["t"]
     batch = cute.sym_int64(symbol="B")
-    pool_hv = cute.sym_int64(symbol="P_times_HV")
+    batch_hv = batch * hv
     batch_plus_one = cute.sym_int64(symbol="B_plus_one")
 
     def dynamic_strided(name: str, dtype: Any, shape: tuple[Any, ...]) -> Any:
@@ -268,7 +224,7 @@ def _compile(request: dict[str, Any], source_file: Path, object_path: Path) -> l
     )
     state = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,
-        (pool_hv, k, v),
+        (batch_hv, k, v),
         stride_order=(2, 1, 0),
         assumed_align=16,
     )

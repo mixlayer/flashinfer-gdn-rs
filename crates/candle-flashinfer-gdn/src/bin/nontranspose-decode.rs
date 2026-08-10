@@ -49,8 +49,9 @@ fn run_case(
         .specialization(specialization)?;
     let plan = NontransposeDecodePlan::prepare(&compiler, &cuda_device, batch)?;
 
-    let pool_size = batch + 5;
+    let pool_size = 2 * batch + 5;
     let pool_indices: Vec<usize> = (0..batch).map(|index| pool_size - 1 - index).collect();
+    let output_pool_indices: Vec<usize> = (0..batch).collect();
     let device_indices: Vec<i32> = pool_indices
         .iter()
         .map(|index| i32::try_from(*index))
@@ -73,6 +74,14 @@ fn run_case(
     let (value, v_quantized) = bf16_tensor(v_values, (batch, 1, HV, V), device)?;
     let (beta, beta_quantized) = bf16_tensor(beta_values, (batch, 1, HV), device)?;
     let state_indices = Tensor::from_vec(device_indices, batch, device)?;
+    let output_state_indices = Tensor::from_vec(
+        output_pool_indices
+            .iter()
+            .map(|index| i32::try_from(*index))
+            .collect::<Result<Vec<_>, _>>()?,
+        batch,
+        device,
+    )?;
     let output = plan.forward(&NontransposeDecodeInputs {
         state: &state,
         a_log: &a_log,
@@ -83,6 +92,7 @@ fn run_case(
         v: &value,
         beta: &beta,
         state_indices: &state_indices,
+        output_state_indices: Some(&output_state_indices),
     })?;
     device.synchronize()?;
 
@@ -98,6 +108,7 @@ fn run_case(
         &beta_quantized,
         plan.specialization().scale,
         &pool_indices,
+        &output_pool_indices,
     );
     let output_error = max_abs_error(&f32_values(&output)?, &expected_output);
     let state_error = max_abs_error(&f32_values(&state)?, &expected_state);
@@ -147,10 +158,16 @@ fn reference(
     beta: &[f32],
     scale: f32,
     state_indices: &[usize],
+    output_state_indices: &[usize],
 ) -> (Vec<f32>, Vec<f32>) {
     let mut state = initial_state.to_vec();
     let mut output = vec![0.0; batch_size * HV * V];
-    for (batch, &state_slot) in state_indices.iter().enumerate().take(batch_size) {
+    for (batch, (&state_slot, &output_state_slot)) in state_indices
+        .iter()
+        .zip(output_state_indices)
+        .enumerate()
+        .take(batch_size)
+    {
         for value_head in 0..HV {
             let query_head = value_head / (HV / H);
             let q_offset = (batch * H + query_head) * K;
@@ -174,19 +191,22 @@ fn reference(
             for value_index in 0..V {
                 let mut state_key = 0.0;
                 for key_index in 0..K {
-                    let state_index =
+                    let source_state_index =
                         ((state_slot * HV + value_head) * K + key_index) * V + value_index;
-                    let state_value = initial_state[state_index] * decay;
-                    state[state_index] = state_value;
+                    let state_value = initial_state[source_state_index] * decay;
                     state_key += state_value * (k[k_offset + key_index] / k_norm);
                 }
                 let delta = (v[gate_index * V + value_index] - state_key) * update_gate;
                 let mut state_query = 0.0;
                 for key_index in 0..K {
-                    let state_index =
+                    let source_state_index =
                         ((state_slot * HV + value_head) * K + key_index) * V + value_index;
-                    state[state_index] += (k[k_offset + key_index] / k_norm) * delta;
-                    state_query += state[state_index] * (q[q_offset + key_index] / q_norm) * scale;
+                    let output_state_index =
+                        ((output_state_slot * HV + value_head) * K + key_index) * V + value_index;
+                    let state_value = initial_state[source_state_index] * decay
+                        + (k[k_offset + key_index] / k_norm) * delta;
+                    state[output_state_index] = state_value;
+                    state_query += state_value * (q[q_offset + key_index] / q_norm) * scale;
                 }
                 output[gate_index * V + value_index] = state_query;
             }

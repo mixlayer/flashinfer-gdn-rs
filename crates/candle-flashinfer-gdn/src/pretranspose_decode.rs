@@ -7,18 +7,19 @@ use flashinfer_gdn::{
 
 use crate::{
     RawTensor, base_address, core_error, cuda_storage, descriptor, descriptor_parts,
-    device_architecture, ensure_ordinal, immutable_address, message, mutable_address,
+    device_architecture, effective_address, ensure_ordinal, immutable_address, message,
+    mutable_address,
+    state_pool::{IndexedStateWorkspace, validate_indexed_state_pool, validate_state_indices},
     storage_dtype,
 };
 
 /// Candle tensors consumed by one pretransposed float-state decode.
 ///
-/// `state` is mutated in place even though Candle tensors use an immutable handle.
-/// In indexed mode, `state_indices` selects the state read for each batch item and
-/// `output_state_indices` selects its write destination. If the latter is omitted,
-/// the read indices are reused for writes.
+/// `state` is always an indexed pool and is mutated in place even though Candle
+/// tensors use an immutable handle. `output_state_indices` selects a distinct write
+/// destination when supplied; otherwise the read indices are reused for writes.
 pub struct PretransposeDecodeInputs<'a> {
-    /// Direct state `[B,HV,V,K]` or pool `[P,HV,V,K]`, float32.
+    /// Main state pool `[P,HV,V,K]`, float32.
     pub state: &'a Tensor,
     /// Log-decay parameter `[HV]`, float32.
     pub a_log: &'a Tensor,
@@ -34,9 +35,9 @@ pub struct PretransposeDecodeInputs<'a> {
     pub v: &'a Tensor,
     /// Update gate `[B,1,HV]`.
     pub beta: &'a Tensor,
-    /// Required int32 `[B]` indices in indexed state-pool mode.
-    pub state_indices: Option<&'a Tensor>,
-    /// Optional int32 `[B]` write indices in indexed state-pool mode.
+    /// Required int32 `[B]` state-pool read indices.
+    pub state_indices: &'a Tensor,
+    /// Optional int32 `[B]` state-pool write indices.
     pub output_state_indices: Option<&'a Tensor>,
 }
 
@@ -49,6 +50,7 @@ pub struct PretransposeDecodePlan {
     direct_state_indices: Tensor,
     direct_output_state_indices: Tensor,
     cu_seqlens: Tensor,
+    state_workspace: Option<IndexedStateWorkspace>,
 }
 
 impl PretransposeDecodePlan {
@@ -76,6 +78,20 @@ impl PretransposeDecodePlan {
         let direct_state_indices = Tensor::zeros(batch, CandleDType::I32, &candle_device)?;
         let direct_output_state_indices = Tensor::zeros(batch, CandleDType::I32, &candle_device)?;
         let cu_seqlens = Tensor::zeros(batch + 1, CandleDType::I32, &candle_device)?;
+        let state_workspace = if compiler.selected_specialization().use_pool_indexing {
+            None
+        } else {
+            Some(IndexedStateWorkspace::new(
+                device,
+                batch,
+                &[
+                    compiler.selected_specialization().hv,
+                    compiler.selected_specialization().v,
+                    compiler.selected_specialization().k,
+                ],
+                CandleDType::F32,
+            )?)
+        };
         Ok(Self {
             core,
             device: device.clone(),
@@ -83,6 +99,7 @@ impl PretransposeDecodePlan {
             direct_state_indices,
             direct_output_state_indices,
             cu_seqlens,
+            state_workspace,
         })
     }
 
@@ -120,46 +137,55 @@ impl PretransposeDecodePlan {
     /// as `modeld-core`'s graph runtime does, and must keep this plan and the
     /// captured tensor allocations alive for the lifetime of the graph.
     pub fn forward(&self, inputs: &PretransposeDecodeInputs<'_>) -> Result<Tensor> {
+        self.validate_pool_contract(inputs)?;
         let output = self.empty_output()?;
         self.execute(inputs, &output)?;
         Ok(output)
     }
 
     fn execute(&self, inputs: &PretransposeDecodeInputs<'_>, output: &Tensor) -> Result<()> {
-        let (state_indices, output_state_indices) = self.indices(inputs)?;
+        let (state_indices, output_state_indices) = self.indices(inputs);
         self.validate_mutable_aliases(inputs, output, state_indices, output_state_indices)?;
-        inputs.state.inplace_op1(&StateLaunch {
-            plan: self,
-            inputs,
-            output,
-            state_indices,
-            output_state_indices,
-        })
+        if self.specialization().use_pool_indexing {
+            inputs.state.inplace_op1(&StateLaunch {
+                plan: self,
+                inputs,
+                output,
+                state_indices,
+                output_state_indices,
+            })
+        } else {
+            inputs.state.inplace_op1(&PoolStateLaunch {
+                plan: self,
+                inputs,
+                output,
+                output_state_indices,
+            })
+        }
     }
 
-    fn indices<'a>(
-        &'a self,
-        inputs: &'a PretransposeDecodeInputs<'a>,
-    ) -> Result<(&'a Tensor, &'a Tensor)> {
-        if self.specialization().use_pool_indexing {
-            let state_indices = inputs.state_indices.ok_or_else(|| {
-                message("indexed decode requires state_indices with shape [batch]")
-            })?;
-            Ok((
-                state_indices,
-                inputs.output_state_indices.unwrap_or(state_indices),
-            ))
-        } else {
-            if inputs.state_indices.is_some() || inputs.output_state_indices.is_some() {
-                return Err(message(
-                    "state-pool indices were supplied to a direct-state specialization",
-                ));
-            }
-            Ok((
-                &self.direct_state_indices,
-                &self.direct_output_state_indices,
-            ))
-        }
+    fn indices<'a>(&'a self, inputs: &'a PretransposeDecodeInputs<'a>) -> (&'a Tensor, &'a Tensor) {
+        (
+            inputs.state_indices,
+            inputs.output_state_indices.unwrap_or(inputs.state_indices),
+        )
+    }
+
+    fn validate_pool_contract(&self, inputs: &PretransposeDecodeInputs<'_>) -> Result<()> {
+        let spec = self.specialization();
+        validate_indexed_state_pool(
+            inputs.state,
+            inputs.state_indices,
+            CandleDType::F32,
+            &[spec.hv, spec.v, spec.k],
+            self.batch,
+        )?;
+        validate_state_indices(
+            inputs.output_state_indices.unwrap_or(inputs.state_indices),
+            self.batch,
+            "output_state_indices",
+        )?;
+        Ok(())
     }
 
     // This is an FFI safety check rather than CUDA Graph preparation. It runs
@@ -229,8 +255,48 @@ impl InplaceOp1 for StateLaunch<'_> {
         let stream = self.plan.device.cuda_stream();
         let (state_ptr, _state_use) = mutable_address(storage, &stream)?;
         self.output.inplace_op1(&OutputLaunch {
-            parent: self,
+            plan: self.plan,
+            inputs: self.inputs,
             state: RawTensor::new(
+                state_ptr,
+                state_dtype,
+                layout,
+                self.plan.core.device_id(),
+                "state",
+            )?,
+            state_indices: self.state_indices,
+            output_state_indices: self.output_state_indices,
+        })
+    }
+}
+
+struct PoolStateLaunch<'a> {
+    plan: &'a PretransposeDecodePlan,
+    inputs: &'a PretransposeDecodeInputs<'a>,
+    output: &'a Tensor,
+    output_state_indices: &'a Tensor,
+}
+
+impl InplaceOp1 for PoolStateLaunch<'_> {
+    fn name(&self) -> &'static str {
+        "flashinfer-gdn-pretranspose-decode-state-pool"
+    }
+
+    fn cpu_fwd(&self, _storage: &mut CpuStorage, _layout: &Layout) -> Result<()> {
+        Err(message("FlashInfer GDN decode requires CUDA storage"))
+    }
+
+    fn cuda_fwd(&self, storage: &mut CudaStorage, layout: &Layout) -> Result<()> {
+        ensure_ordinal(storage, self.plan.core.device_id(), "state")?;
+        let state_dtype = storage_dtype(storage)?;
+        let stream = self.plan.device.cuda_stream();
+        let (state_ptr, _state_use) = mutable_address(storage, &stream)?;
+        let workspace = self.plan.state_workspace.as_ref().ok_or_else(|| {
+            message("direct-state pretranspose specialization has no state workspace")
+        })?;
+        workspace.compact().inplace_op1(&CompactStateLaunch {
+            parent: self,
+            pool: RawTensor::new(
                 state_ptr,
                 state_dtype,
                 layout,
@@ -241,12 +307,100 @@ impl InplaceOp1 for StateLaunch<'_> {
     }
 }
 
-struct OutputLaunch<'a, 'b> {
-    parent: &'a StateLaunch<'b>,
-    state: RawTensor,
+struct CompactStateLaunch<'a, 'b> {
+    parent: &'a PoolStateLaunch<'b>,
+    pool: RawTensor,
 }
 
-impl InplaceOp1 for OutputLaunch<'_, '_> {
+impl InplaceOp1 for CompactStateLaunch<'_, '_> {
+    fn name(&self) -> &'static str {
+        "flashinfer-gdn-pretranspose-decode-compact-state"
+    }
+
+    fn cpu_fwd(&self, _storage: &mut CpuStorage, _layout: &Layout) -> Result<()> {
+        Err(message("FlashInfer GDN decode requires CUDA storage"))
+    }
+
+    fn cuda_fwd(&self, storage: &mut CudaStorage, layout: &Layout) -> Result<()> {
+        let plan = self.parent.plan;
+        ensure_ordinal(storage, plan.core.device_id(), "compact_state")?;
+        let compact_dtype = storage_dtype(storage)?;
+        let stream = plan.device.cuda_stream();
+        let (compact_ptr, _compact_use) = mutable_address(storage, &stream)?;
+
+        let (read_indices_storage, read_indices_layout) =
+            self.parent.inputs.state_indices.storage_and_layout();
+        let (write_indices_storage, write_indices_layout) =
+            self.parent.output_state_indices.storage_and_layout();
+        let read_indices_storage = cuda_storage(&read_indices_storage, "state_indices")?;
+        let write_indices_storage = cuda_storage(&write_indices_storage, "output_state_indices")?;
+        ensure_ordinal(read_indices_storage, plan.core.device_id(), "state_indices")?;
+        ensure_ordinal(
+            write_indices_storage,
+            plan.core.device_id(),
+            "output_state_indices",
+        )?;
+        let (read_indices_ptr, _read_indices_use) =
+            immutable_address(read_indices_storage, &stream)?;
+        let (write_indices_ptr, _write_indices_use) =
+            immutable_address(write_indices_storage, &stream)?;
+
+        let pool = self.pool.effective_address("state")?;
+        let read_indices = effective_address(
+            read_indices_ptr,
+            storage_dtype(read_indices_storage)?,
+            read_indices_layout,
+            "state_indices",
+        )?;
+        let write_indices = effective_address(
+            write_indices_ptr,
+            storage_dtype(write_indices_storage)?,
+            write_indices_layout,
+            "output_state_indices",
+        )?;
+        let compact = effective_address(compact_ptr, compact_dtype, layout, "compact_state")?;
+        let workspace = plan.state_workspace.as_ref().ok_or_else(|| {
+            message("direct-state pretranspose specialization has no state workspace")
+        })?;
+
+        // SAFETY: the surrounding Candle guards keep the validated pool, index,
+        // and compact workspace allocations live on this stream.
+        unsafe {
+            workspace.gather(&stream, pool, read_indices, compact)?;
+        }
+
+        self.parent.output.inplace_op1(&OutputLaunch {
+            plan,
+            inputs: self.parent.inputs,
+            state: RawTensor::new(
+                compact_ptr,
+                compact_dtype,
+                layout,
+                plan.core.device_id(),
+                "compact_state",
+            )?,
+            state_indices: &plan.direct_state_indices,
+            output_state_indices: &plan.direct_output_state_indices,
+        })?;
+
+        // SAFETY: FlashInfer's compact-state update is ordered before this
+        // writeback on the same stream and all allocation guards remain live.
+        unsafe {
+            workspace.scatter(&stream, compact, write_indices, pool)?;
+        }
+        Ok(())
+    }
+}
+
+struct OutputLaunch<'a> {
+    plan: &'a PretransposeDecodePlan,
+    inputs: &'a PretransposeDecodeInputs<'a>,
+    state: RawTensor,
+    state_indices: &'a Tensor,
+    output_state_indices: &'a Tensor,
+}
+
+impl InplaceOp1 for OutputLaunch<'_> {
     fn name(&self) -> &'static str {
         "flashinfer-gdn-pretranspose-decode-output"
     }
@@ -257,23 +411,22 @@ impl InplaceOp1 for OutputLaunch<'_, '_> {
 
     #[allow(clippy::too_many_lines)]
     fn cuda_fwd(&self, output_storage: &mut CudaStorage, output_layout: &Layout) -> Result<()> {
-        let plan = self.parent.plan;
+        let plan = self.plan;
         ensure_ordinal(output_storage, plan.core.device_id(), "output")?;
         let output_dtype = storage_dtype(output_storage)?;
         let stream = plan.device.cuda_stream();
         let (output_ptr, _output_use) = mutable_address(output_storage, &stream)?;
 
-        let (a_log_storage, a_log_layout) = self.parent.inputs.a_log.storage_and_layout();
-        let (a_storage, a_layout) = self.parent.inputs.a.storage_and_layout();
-        let (dt_bias_storage, dt_bias_layout) = self.parent.inputs.dt_bias.storage_and_layout();
-        let (q_storage, q_layout) = self.parent.inputs.q.storage_and_layout();
-        let (k_storage, k_layout) = self.parent.inputs.k.storage_and_layout();
-        let (v_storage, v_layout) = self.parent.inputs.v.storage_and_layout();
-        let (beta_storage, beta_layout) = self.parent.inputs.beta.storage_and_layout();
-        let (state_indices_storage, state_indices_layout) =
-            self.parent.state_indices.storage_and_layout();
+        let (a_log_storage, a_log_layout) = self.inputs.a_log.storage_and_layout();
+        let (a_storage, a_layout) = self.inputs.a.storage_and_layout();
+        let (dt_bias_storage, dt_bias_layout) = self.inputs.dt_bias.storage_and_layout();
+        let (q_storage, q_layout) = self.inputs.q.storage_and_layout();
+        let (k_storage, k_layout) = self.inputs.k.storage_and_layout();
+        let (v_storage, v_layout) = self.inputs.v.storage_and_layout();
+        let (beta_storage, beta_layout) = self.inputs.beta.storage_and_layout();
+        let (state_indices_storage, state_indices_layout) = self.state_indices.storage_and_layout();
         let (output_indices_storage, output_indices_layout) =
-            self.parent.output_state_indices.storage_and_layout();
+            self.output_state_indices.storage_and_layout();
         let (cu_seqlens_storage, cu_seqlens_layout) = plan.cu_seqlens.storage_and_layout();
 
         let a_log_storage = cuda_storage(&a_log_storage, "a_log")?;

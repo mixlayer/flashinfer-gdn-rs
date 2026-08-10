@@ -6,9 +6,11 @@ The workspace, generic TVM artifact runtime, and four decode paths are implement
 The pinned pretransposed and non-transposed float-state kernels and BF16-state
 single-token and checkpointed MTP kernels can be projected from upstream source,
 compiled through a Rust-owned content-addressed cache, loaded behind validated safe
-Rust plans, and called with Candle CUDA tensors. Pretransposed direct state and
-indexed state pools have nonzero numerical coverage plus CUDA Graph capture and
-replay on SM121a. Non-transposed indexed float-state pools, same-slot indexed
+Rust plans, and called with Candle CUDA tensors. The Candle layer exposes indexed
+state pools uniformly: native indexing is used where available and a reusable
+device gather/scatter fallback adapts compact-state kernels. Pretransposed indexed
+state pools have nonzero numerical coverage plus CUDA Graph capture and replay on
+SM121a. Non-transposed indexed float-state pools, same-slot indexed
 BF16-state pools, and per-token MTP checkpoint scatter have eager numerical coverage
 across their upstream dispatch families. Accepted-prefix fused recovery, split-pool
 writes, and prefill coverage remain pending.
@@ -417,21 +419,24 @@ any state or output sharing the same CUDA allocation as another argument; this
 check prevents recursive Candle storage locking and is unrelated to graph
 preparation.
 
-Indexed float-state pools retain a dynamic four-dimensional layout, but the K mode
-must be contiguous and each outer element stride must be divisible by four. This is
-the 16-byte alignment contract required by the kernel's 128-bit `cp.async` atom and
-is encoded in both the CuTeDSL fake tensor and safe Rust validation.
+The Candle APIs standardize recurrent state as a compact four-dimensional pool plus
+required int32 read indices `[B]`. Optional write indices are exposed where the
+kernel semantics support split destinations. Native indexed backends receive the
+pool directly. A reusable, plan-owned compact workspace adapts backends that only
+accept `[B,...]`: a small CUDA utility gathers selected rows, FlashInfer updates the
+workspace, and the utility scatters results back on the same stream. Workspace
+allocation and utility compilation happen during plan preparation, not launch or
+capture. Indices must be nonnegative, in range, and unique within a concurrent
+write; inspecting their GPU values is intentionally not a host-side launch step.
 
-The non-transposed Rust API accepts the persistent compact state pool
-`[P,HV,K,V]` and required int32 indices `[B]`; it does not gather a temporary
-per-batch state. The upstream device kernel already computes
-`flat_idx = pool_idx * HV + i_hv`, but its Python launch JIT derives grid size from
-the direct-state dimension `B*HV`. The versioned shim applies a checked AST
-adaptation to both small- and large-batch launch JITs so grid size comes from the
-index tensor (`B*HV`) while pool capacity remains independently dynamic (`P*HV`).
-The adapter fails compilation if the expected upstream assignments move or change.
-Indices must be in range and unique within a concurrent batch; inspecting their GPU
-values is intentionally not a host-side launch step.
+The sys and framework-independent core APIs remain faithful to each FlashInfer
+backend. In particular, non-transposed core decode accepts compact float state
+`[B,HV,K,V]`; its compiler shim projects the pinned source without changing the
+launch grid. The Candle nontranspose plan presents `[P,HV,K,V]` plus indices and
+uses the shared gather/scatter fallback. Pretranspose uses FlashInfer's native
+indexed path when `use_pool_indexing=true` and the same fallback for a direct-state
+specialization. Candle pools are compact; the lower native pretranspose API retains
+its broader K-contiguous strided contract.
 
 FlashInfer selects two different non-transposed kernels at `B=32`. The batch class
 is part of the specialization and cache key, and both core and Candle plans reject
@@ -545,15 +550,17 @@ these gates on an NVIDIA GB10 (SM121a):
   event tracking disabled as it is in `modeld-core`.
 
 Observed maximum errors for the deterministic `H=HV=1`, `K=V=128`, `B=2` case were
-`2.55e-5` for direct BF16 output, `2.8e-9` for direct float state, `2.96e-5` for
-indexed output, and `2.9e-9` for indexed destination state. These are implementation
-acceptance values, not promised public tolerances.
+`2.55e-5` for the compact-backend fallback's BF16 output, `2.8e-9` for its float
+state, `2.96e-5` for native-indexed output, and `2.9e-9` for the native-indexed
+destination state. These are implementation acceptance values, not promised public
+tolerances.
 
 The eager-only `nontranspose-decode` acceptance executable covers both upstream
-execution classes with indexed K-major state pools. On the same SM121a host, observed
-maximum errors were `1.50e-5` output and `1.9e-9` state for `B=2`, and `1.53e-5`
-output and `3.8e-9` state for `B=32`. CUDA Graph replay is intentionally left to the
-external graph owner and was not repeated for this second kernel.
+execution classes with distinct read/write indices into K-major state pools. On the
+same SM121a host, observed maximum errors were `1.48e-5` output and `2.8e-9` state
+for `B=2`, and `1.53e-5` output and `3.8e-9` state for `B=32`. CUDA Graph replay is
+intentionally left to the external graph owner and was not repeated for this second
+kernel.
 
 The eager-only `bf16-state-decode` acceptance executable covers both upstream
 BF16-state dispatch families with nonidentity indices into a larger V-major pool.
@@ -588,9 +595,9 @@ with the upstream TVM ABI.
    subprocess timeout/logging, failure and corruption retention, AOT export/link,
    atomic publication, manifest validation, and the TVM module loader are proven by
    CPU tests and the GDN GPU smoke path.
-3. **Decode vertical slice (complete)** — pretransposed decode, direct and indexed
-   float state, Candle integration, numerical tests, external eager warmup, and CUDA
-   Graph replay on multiple explicit streams.
+3. **Decode vertical slice (complete)** — pretransposed decode with a uniform
+   indexed-pool Candle API over native and compact-state backends, numerical tests,
+   external eager warmup, and CUDA Graph replay on multiple explicit streams.
 4. **Decode coverage (in progress)** — non-transposed float-state indexed-pool
    decode is complete for small and large batches, and same-slot BF16-state T=1
    decode plus checkpointed `T>=2` MTP are complete for ILP4 and wide-vector

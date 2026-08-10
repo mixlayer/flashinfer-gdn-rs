@@ -8,7 +8,7 @@ use flashinfer_gdn::{
 use crate::{
     RawTensor, base_address, core_error, cuda_storage, descriptor, descriptor_parts,
     device_architecture, device_multiprocessor_count, ensure_ordinal, immutable_address, message,
-    mutable_address, storage_dtype,
+    mutable_address, state_pool::validate_indexed_state_pool, storage_dtype,
 };
 
 /// Candle tensors consumed by one same-slot BF16-state decode.
@@ -115,6 +115,14 @@ impl Bf16StateDecodePlan {
 
     /// Runs BF16-state GDN decode and returns the BF16 output.
     pub fn forward(&self, inputs: &Bf16StateDecodeInputs<'_>) -> Result<Tensor> {
+        let spec = self.specialization();
+        validate_indexed_state_pool(
+            inputs.state,
+            inputs.state_indices,
+            CandleDType::BF16,
+            &[spec.hv, spec.v, spec.k],
+            self.batch,
+        )?;
         let output = self.empty_output()?;
         self.validate_mutable_aliases(inputs, &output)?;
         inputs.state.inplace_op1(&StateLaunch {

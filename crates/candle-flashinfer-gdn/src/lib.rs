@@ -20,6 +20,7 @@ mod bf16_state_decode;
 mod bf16_state_mtp;
 mod nontranspose_decode;
 mod pretranspose_decode;
+mod state_pool;
 
 pub use bf16_state_decode::{Bf16StateDecodeInputs, Bf16StateDecodePlan};
 pub use bf16_state_mtp::{Bf16StateMtpInputs, Bf16StateMtpPlan};
@@ -73,6 +74,14 @@ impl RawTensor {
             )
         }
         .map_err(core_error)
+    }
+
+    fn effective_address(&self, name: &'static str) -> Result<usize> {
+        let offset = usize::try_from(self.byte_offset)
+            .map_err(|_| message(format!("{name} byte offset does not fit usize")))?;
+        self.address
+            .checked_add(offset)
+            .ok_or_else(|| message(format!("{name} effective CUDA address overflows usize")))
     }
 }
 
@@ -194,6 +203,19 @@ fn byte_offset(dtype: CandleDType, layout: &Layout, name: &'static str) -> Resul
         .checked_mul(dtype.size_in_bytes())
         .ok_or_else(|| message(format!("{name} byte offset overflows usize")))?;
     u64::try_from(bytes).map_err(|_| message(format!("{name} byte offset does not fit u64")))
+}
+
+fn effective_address(
+    address: usize,
+    dtype: CandleDType,
+    layout: &Layout,
+    name: &'static str,
+) -> Result<usize> {
+    let offset = usize::try_from(byte_offset(dtype, layout, name)?)
+        .map_err(|_| message(format!("{name} byte offset does not fit usize")))?;
+    address
+        .checked_add(offset)
+        .ok_or_else(|| message(format!("{name} effective CUDA address overflows usize")))
 }
 
 fn ensure_ordinal(storage: &CudaStorage, expected: i32, name: &'static str) -> Result<()> {
