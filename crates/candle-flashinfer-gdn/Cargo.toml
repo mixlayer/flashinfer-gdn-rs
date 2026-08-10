@@ -3,8 +3,8 @@ name = "candle-flashinfer-gdn"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [dependencies]
 candle.workspace = true
 flashinfer-gdn.workspace = true
-

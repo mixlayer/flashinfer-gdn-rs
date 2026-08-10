@@ -3,6 +3,7 @@ name = "flashinfer-gdn"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [dependencies]
 flashinfer-gdn-sys.workspace = true
