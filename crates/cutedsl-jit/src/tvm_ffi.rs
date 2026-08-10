@@ -31,6 +31,8 @@ pub struct DlDevice {
 pub enum DlDataTypeCode {
     /// Signed integer.
     Int = 0,
+    /// Unsigned integer.
+    UInt = 1,
     /// IEEE floating point.
     Float = 2,
     /// Brain floating point.
@@ -199,6 +201,7 @@ mod tests {
     fn raw_values_match_official_headers() {
         assert_eq!(DlDeviceType::Cuda as u32, 2);
         assert_eq!(DlDataTypeCode::Int as u8, 0);
+        assert_eq!(DlDataTypeCode::UInt as u8, 1);
         assert_eq!(DlDataTypeCode::Float as u8, 2);
         assert_eq!(DlDataTypeCode::Bfloat as u8, 4);
         assert_eq!(TvmFfiTypeIndex::None as i32, 0);

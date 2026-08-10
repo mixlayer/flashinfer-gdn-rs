@@ -2,21 +2,22 @@
 
 ## Scope
 
-This workspace is a deliberately narrow Rust integration for the BF16-state GDN
-decode kernels in **FlashInfer 0.6.16.post2** (`v0.6.16.post2`, commit
-`c498513a891d424e9ebb2518a1a3c53122dbf257`). It supports two operations:
+This workspace is a deliberately narrow Rust integration for GDN kernels in
+**FlashInfer 0.6.16.post2** (`v0.6.16.post2`, commit
+`c498513a891d424e9ebb2518a1a3c53122dbf257`). It supports three operations:
 
 1. same-slot single-token decode (`T=1`); and
-2. checkpointed multi-token-prediction decode (`T>=2`).
+2. checkpointed multi-token-prediction decode (`T>=2`); and
+3. non-context-parallel variable-length prefill.
 
-Both paths are implemented end to end: a pinned CuTeDSL source projection, a
+All three paths are implemented end to end: a pinned CuTeDSL source projection, a
 content-addressed compiler cache, a typed TVM FFI boundary, safe Rust validation,
 and Candle tensor adapters.
 
 The following are out of scope for this crate's initial integration:
 
 - FP32-state pretransposed or non-transposed decode;
-- chunked or context-parallel prefill;
+- context-parallel prefill;
 - split read/write state pools;
 - PyTorch adapters;
 - a second CuTe packed-ABI launch path; and
@@ -33,14 +34,14 @@ crates/
 │   └── Framework-independent compiler protocol, artifact cache, manifest
 │       validation, dynamic loading, and TVM FFI primitives.
 ├── flashinfer-gdn-sys/
-│   └── Pinned FlashInfer source/shim discovery, BF16 decode specialization
+│   └── Pinned FlashInfer source/shim discovery, decode/prefill specialization
 │       schemas, compilation, and unsafe typed entrypoints.
 ├── flashinfer-gdn/
 │   └── Framework-independent tensor contracts, validation, prepared plans, and
 │       explicit-stream launches.
 └── candle-flashinfer-gdn/
-    └── Unified Candle decode dispatch, CUDA tensor conversion, state-pool
-        interface, and in-place state mutation for T=1 and MTP.
+    └── Unified Candle decode/prefill dispatch, CUDA tensor conversion,
+        state-pool interface, and in-place state mutation.
 ```
 
 `cutedsl-jit` remains generic so later CuTeDSL integrations can reuse the compiler,
@@ -58,24 +59,22 @@ state_indices: [B]           int32
 The pinned kernels require `K=V=128`. `state_indices[b]` names the input state for
 batch item `b`.
 
-The same pool-plus-indices contract is retained on every architecture. The current
-BF16 FlashInfer kernels support pool indexing natively, so the adapter passes the
-pool and indices through without a preliminary copy. The Candle crate also retains
-a private, plan-owned gather/scatter workspace for a future backend that accepts
-only compact `[B,...]` state. That fallback allocates at plan preparation time and
-enqueues gather, kernel, and scatter operations on the plan's CUDA stream, keeping
-launches graph-capturable and leaving the public input shape unchanged.
+The same pool-plus-indices contract is retained on every architecture. BF16 decode
+and SM100/SM103 prefill support pool indexing natively. SM90 and SM120/SM121
+prefill only accept compact float32 `[B,...]` state, so their Candle plans own the
+compact buffer and enqueue fused gather/cast, kernel, and fused scatter/cast work
+on one stream. All fallback allocations occur during plan preparation.
 
 Writable pool indices must be in range and unique for concurrently executing batch
 items. The Rust layer validates tensor shapes, dtypes, contiguity, device identity,
 and aliasing. Index values reside on the GPU; ownership and collision-free slot
 assignment remain responsibilities of the caller.
 
-The public integration exposes one reusable opaque `GdnHandle`, a model-owned
-`GdnDecode`, one `DecodeInputs` structure, and one opaque `DecodePlan`. The first
-handle lazily initializes a process-wide locked Python environment; handles own
-only the selected environment identity plus their artifact-cache, source-tree, and
-compiler-timeout configuration.
+The public integration exposes one reusable opaque `GdnHandle`, model-owned
+`GdnDecode` and `GdnPrefill` runtimes, unified input structures, and opaque plans.
+The first handle lazily initializes a process-wide locked Python environment;
+handles own only the selected environment identity plus their artifact-cache,
+source-tree, and compiler-timeout configuration.
 
 `GdnDecode::new(&handle, &device, config)` records `H/HV/K/V`, captures the
 Candle CUDA device and stream, and queries the GPU architecture, device ordinal,
@@ -86,6 +85,11 @@ allocates fresh plan-owned dummy tensors.
 `DecodePlan::forward` dispatches to the prepared backend. The only mode-specific
 input is optional `[B,T]` `checkpoint_indices`, which is required for MTP and
 ignored for `T=1`.
+
+`GdnPrefill::new` records the same model/device properties and selects SM90,
+SM100/SM103, or SM120/SM121 once. `prepare(&q, &cu_seqlens)` fixes `N/B` and owns
+all architecture auxiliaries. `PrefillPlan::forward` always receives the BF16 pool
+and int32 indices irrespective of the selected low-level state contract.
 
 ## `T=1` decode
 
@@ -152,6 +156,31 @@ MTP dispatch is:
 
 `T`, the kernel family, and tile size all participate in the artifact key.
 
+## Non-context-parallel prefill
+
+The public Candle contract is:
+
+```text
+state:         [P, HV, 128, 128] BF16, mutable
+state_indices: [B]               int32
+q/k:           [N, H, 128]       BF16
+v:             [N, HV, 128]      BF16
+alpha:         [N, HV]           float32, multiplicative forget gate
+beta:          [N, HV]           float32, update gate
+cu_seqlens:    [B+1]             int32
+output:        [N, HV, 128]      BF16
+```
+
+Q and K are normalized before this API; the pinned prefill kernels do not use the
+Torch API's normalization flag. SM100/SM103 reads and writes the selected BF16
+pool slots directly. SM90 and SM120/SM121 gather/cast those slots to compact
+float32 state, convert cumulative lengths to int64, invoke the upstream kernel,
+then scatter/cast final state back. Checkpoint-enabled specializations retain the
+same indexed BF16 main-state contract and expose compact BF16 checkpoint rows
+described by per-sequence cumulative row offsets. SM90/SM120 use plan-owned
+float32 checkpoint scratch and a post-kernel cast; SM100 writes BF16 checkpoints
+directly. Context-parallel prefill remains out of scope.
+
 ## Compilation and ABI
 
 The GDN shims compile with CuTeDSL's generated TVM FFI ABI. The generated wrapper
@@ -183,11 +212,11 @@ libraries without invoking Python. Invalid entries are quarantined and rebuilt.
 1. `FLASHINFER_ROOT`, when explicitly set; otherwise
 2. `crates/flashinfer-gdn-sys/vendor/flashinfer`, pinned to the release commit.
 
-Only `LICENSE` and `flashinfer/gdn_kernels/gdn_decode_bf16_state.py` are required by
-the reduced build. The consumed source file is included in the artifact digest, and
-the shim checks its expected extraction boundaries. Published crate sources need
-not retain Git metadata; a source checkout that does retain metadata is checked
-against the pinned commit by default.
+The reduced build requires `LICENSE`, the BF16 decode source, the SM100 chunked
+prefill source and scheduler, and the SM90/SM120 delta-rule sources and directly
+imported helpers. Every consumed file is included in the corresponding artifact
+digest. Published crate sources need not retain Git metadata; a source checkout
+that does retain metadata is checked against the pinned commit by default.
 
 ## Python dependencies
 
@@ -216,9 +245,9 @@ serving request.
 
 ## CUDA Graph lifecycle
 
-`GdnDecode` is created with the model and remains alive across forwards. Plans are
-created for fixed `B/T` before graph capture. The first effective specialization
-may compile or load an artifact; later plans reuse the loaded module. Every plan
+`GdnDecode` and `GdnPrefill` are created with the model and remain alive across
+forwards. Plans are created for fixed runtime shapes before graph capture. The
+first effective specialization may compile or load an artifact; later plans reuse the loaded module. Every plan
 allocates and owns fresh batch-sized dummy tensors. `forward` has no special
 preflight, warmup, or rebinding API; the application uses the same call in eager
 and capture execution. A plan must remain alive as long as a captured graph can
@@ -236,9 +265,9 @@ Completed workspace coverage includes:
 - eager numerical acceptance for `T=1` ILP4 and wide-vector variants using indexed
   BF16 pools; and
 - eager numerical acceptance for `T=2` ILP4 and wide-vector variants, including all
-  checkpoint writes.
+  checkpoint writes; and
+- cross-compilation of every prefill backend plus eager SM121 numerical acceptance
+  covering output and indexed BF16 state updates.
 
-The next integration milestone is to wire the two Candle plans into the consumer's
-decode path, using its existing state allocator and CUDA Graph lifecycle. CUDA Graph
-replay verification and support for additional FlashInfer kernels are intentionally
-deferred until that integration is operational.
+CUDA Graph replay verification, context-parallel prefill, and additional
+FlashInfer kernel families remain deferred.

@@ -103,9 +103,9 @@ pub(crate) fn validate_state_indices(
 /// Graph-stable compact state storage used when an upstream kernel only accepts
 /// one state per batch item.
 ///
-/// The current BF16 kernels index pools natively. This workspace is retained so
-/// future architecture-specific backends can preserve the same public pool-plus-
-/// indices contract without adding launch-time allocation.
+/// Raw same-dtype pool copies retained for kernel families that need a compact
+/// adapter without state conversion. Prefill's BF16/F32 conversion uses its own
+/// fused adapter.
 #[derive(Debug)]
 #[allow(dead_code)]
 pub(crate) struct IndexedStateWorkspace {

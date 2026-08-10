@@ -1,9 +1,9 @@
 # GDN CuTeDSL shims
 
-The versioned compiler shim loads the pinned FlashInfer 0.6.16.post2 BF16-state
-decode implementation from the source tree supplied by Cargo, constructs the exact
-specialization, compiles with `--enable-tvm-ffi`, and exports a loadable AOT
-artifact. It neither installs FlashInfer nor imports a copy from site-packages.
+The versioned compiler shims load pinned FlashInfer 0.6.16.post2 GDN sources from
+the tree supplied by Cargo, construct exact specializations, compile with
+`--enable-tvm-ffi`, and export loadable AOT artifacts. They neither install
+FlashInfer nor import a copy from site-packages.
 
 `compile_bf16_state_decode.py` covers both supported requests:
 
@@ -16,6 +16,17 @@ kernel family, tile size, packed-FMA selection, and checkpoint behavior. The shi
 extracts an auditable Torch-free projection from
 `flashinfer/gdn_kernels/gdn_decode_bf16_state.py` before invoking CuTeDSL. This
 adapter is intentionally specific to the pinned FlashInfer source revision.
+
+`compile_prefill.py` covers non-context-parallel prefill on SM90, SM100/SM103,
+and SM120/SM121. SM100 uses native indexed BF16 state; SM90 and SM120 use compact
+float32 state. The shim imports the exact architecture source and local helper
+modules without importing FlashInfer's Torch-facing package. Token, sequence, and
+pool extents are dynamic; head counts, dimensions, state dtype, scale,
+architecture, SM count, and checkpoint interval are specialization inputs.
+Checkpoint-enabled modules write architecture-native compact checkpoint rows
+(float32 on SM90/SM120 and BF16 on indexed-state SM100) and consume native
+cumulative row offsets (int64 on SM90/SM120 and int32 on SM100).
+Context-parallel dispatch is not included.
 
 ## Compiler environment
 

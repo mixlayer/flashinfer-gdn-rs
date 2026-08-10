@@ -1,14 +1,19 @@
 # candle-flashinfer-gdn
 
-Candle integration for the BF16-state GDN decode kernels in FlashInfer
-0.6.16.post2. This crate intentionally supports only:
+Candle integration for GDN kernels in FlashInfer 0.6.16.post2. It supports:
 
 - single-token (`T=1`) decode; and
-- checkpointed multi-token prediction (`T>=2`) decode.
+- checkpointed multi-token prediction (`T>=2`) decode; and
+- non-context-parallel variable-length prefill.
 
-Both operations use BF16 inputs, float32 `a_log` and `dt_bias`, and a contiguous
+Both decode operations use BF16 inputs, float32 `a_log` and `dt_bias`, and a contiguous
 V-major BF16 state pool shaped `[P,HV,V,K]`. The pinned kernels require
 `K=V=128`.
+
+Prefill uses BF16 Q/K/V/output, float32 multiplicative `alpha` and update `beta`,
+and int32 `cu_seqlens`. Q and K must be L2-normalized by the caller. Optional
+checkpointed prefill emits compact BF16 checkpoint rows while retaining the
+same indexed BF16 main-state interface.
 
 ## State-pool interface
 
@@ -21,11 +26,12 @@ contract across GPU architectures:
 - `DecodeInputs::checkpoint_indices: Option<[B,T]>` is `None` for `T=1`. MTP
   requires it and writes `h_1` through `h_T` into the selected main-pool slots.
 
-FlashInfer's current BF16 kernels implement this indirection natively, so these
-indices pass directly to the compiled kernel. The crate retains a graph-stable
-gather/scatter adapter for a future architecture-specific backend that only accepts
-compact per-batch state. Such a backend can therefore preserve the same public
-pool-plus-indices signature without allocating during a launch.
+FlashInfer's current BF16 decode kernels implement this indirection natively, so
+these indices pass directly to the compiled kernel. For prefill, SM100/SM103 also
+indexes the BF16 pool natively. SM90 and SM120/SM121 use a plan-owned compact
+`[B,HV,V,K]` float32 tensor. `PrefillPlan::forward` fuses pool gather with
+BF16-to-F32 conversion, launches FlashInfer, then fuses F32-to-BF16 conversion
+with scatter back to the selected slots.
 
 Concurrent writes must target distinct in-range pool slots. For MTP, checkpoint
 slots must be fresh, mutually distinct, and must not overlap the input slots while
@@ -35,7 +41,8 @@ active state.
 
 ## Dispatch
 
-`GdnDecode` records the CUDA device and `H/HV/K/V` model dimensions once.
+`GdnDecode` and `GdnPrefill` record the CUDA device and `H/HV/K/V` model
+dimensions once.
 `GdnDecode::prepare(&x)` reads `B/T` from the input tensor's leading two dimensions,
 chooses single-token versus MTP, and reproduces the pinned upstream dispatch
 internally:
@@ -69,6 +76,29 @@ There is no GDN-specific warmup or tensor-binding phase. The surrounding graph
 runtime remains responsible for its normal eager warmup, capture, replay, and any
 state restoration its warmup policy requires.
 
+## Prefill lifecycle
+
+Create `GdnPrefill` at model load. `GdnPrefill::prepare(&q, &cu_seqlens)` reads
+`N` and `B`, loads the architecture backend, and allocates a fresh plan's TMA
+workspace. SM90 and SM120/SM121 plans additionally allocate compact float32 state
+and int64 cumulative-length scratch. All auxiliary allocations and NVRTC
+compilation happen in preparation, not `forward`.
+
+`PrefillPlan::forward` accepts the common BF16 state pool plus int32 pool indices,
+returns `[N,HV,V]` BF16, and updates the selected pool slots.
+
+Call `prepare_checkpointed(&q, &cu_seqlens, interval, C)` with a positive
+multiple-of-64 interval and the caller-provided total row count. The
+model-owned `GdnPrefill` caches both ordinary and checkpoint-enabled modules, so
+the choice remains launch-specific. Checkpointed launches additionally require mutable compact BF16
+`state_checkpoints: [C,HV,V,K]` and int32
+`checkpoint_cu_starts: [B+1]`. Checkpoint rows are ordered by sequence and are
+independent of the persistent pool slot namespace. The offsets begin at zero, end
+at `C`, and assign `floor(sequence_length / interval)` rows to each sequence, so callers can scatter/cast
+only rows selected for retention. SM90/SM120 use plan-owned float32 checkpoint
+scratch and cast it to this BF16 output; SM100 writes the BF16 output directly.
+Only non-context-parallel prefill is currently supported.
+
 ## Acceptance executables
 
 The eager BF16 `T=1` acceptance executable covers the ILP4 and wide-vector dispatch
@@ -85,6 +115,17 @@ checkpoint write:
 ```shell
 RUSTFLAGS="-C target-cpu=native" \
 cargo run -p candle-flashinfer-gdn --bin bf16-state-mtp
+```
+
+The architecture-dispatched prefill executable validates output and indexed state
+updates:
+
+```shell
+RUSTFLAGS="-C target-cpu=native" \
+cargo run -p candle-flashinfer-gdn --bin gdn-prefill
+
+GDN_PREFILL_CHECKPOINTS=1 RUSTFLAGS="-C target-cpu=native" \
+cargo run -p candle-flashinfer-gdn --bin gdn-prefill
 ```
 
 The `target-cpu` setting is needed by the current Candle CPU GEMM dependency on the

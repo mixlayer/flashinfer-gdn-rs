@@ -1,7 +1,7 @@
 # flashinfer-gdn-rs
 
-Rust bindings and a Candle adapter for FlashInfer's BF16-state gated delta net
-(GDN) decode kernels.
+Rust bindings and a Candle adapter for FlashInfer's gated delta net (GDN) decode
+and non-context-parallel prefill kernels.
 
 The workspace pins FlashInfer `0.6.16.post2`, compiles its CuTeDSL kernels into
 loadable TVM FFI artifacts on demand, and caches those artifacts on the host.
@@ -10,19 +10,23 @@ are separated into reusable layers.
 
 ## Supported kernels
 
-The current API intentionally supports two BF16-state decode modes:
+The current API supports:
 
 - single-token decode (`T=1`), which updates each selected state-pool slot; and
-- multi-token prediction (`T>=2`), which writes a checkpoint after every token.
+- multi-token prediction (`T>=2`), which writes a checkpoint after every token;
+- variable-length, non-context-parallel prefill on SM90, SM100/SM103, and
+  SM120/SM121, with optional compact checkpoint emission.
 
-Both modes require:
+Both decode modes require:
 
 - BF16 query, key, value, gate, and state tensors;
 - float32 `a_log` and `dt_bias` tensors;
 - `K=V=128`; and
 - a contiguous V-major state pool shaped `[P,HV,V,K]`.
 
-Prefill and FP32-state kernels are not currently exposed.
+Prefill accepts BF16 Q/K/V, float32 `alpha`/`beta`, int32 cumulative lengths, and
+the same indexed V-major BF16 pool used by decode. Q and K must already be L2
+normalized; the pinned prefill implementations do not fuse normalization.
 
 ## Workspace
 
@@ -32,14 +36,15 @@ Prefill and FP32-state kernels are not currently exposed.
   compiler shims, specialization schemas, and unsafe typed entrypoints.
 - `flashinfer-gdn` provides framework-independent CUDA tensor contracts,
   validation, prepared plans, and explicit-stream launches.
-- `candle-flashinfer-gdn` provides the model-owned decode runtime, unified Candle
-  inputs, state-pool indexing, and in-place state updates.
+- `candle-flashinfer-gdn` provides model-owned decode/prefill runtimes, unified
+  Candle inputs, state-pool indexing, and in-place state updates.
 
 ## Requirements
 
 The checked-in compiler lock currently targets Linux aarch64, Python 3.12, and
-CUDA 13. A host C compiler is required to link generated modules. The current
-BF16-state integration targets SM100 or newer NVIDIA GPUs.
+CUDA 13. A host C compiler is required to link generated modules. The decode
+kernels target compute capability 9.0 or newer. Prefill dispatches
+explicitly among SM90, SM100/SM103, and SM120/SM121.
 
 Clone the pinned FlashInfer source submodule with the workspace:
 
@@ -136,6 +141,65 @@ The plan and all input tensors must use the same Candle CUDA device. Keep a plan
 alive for as long as any captured CUDA graph can reference its auxiliary
 allocations.
 
+### Prefill
+
+Create a model-owned prefill runtime alongside the model:
+
+```rust
+use candle_flashinfer_gdn::{GdnPrefill, GdnPrefillConfig};
+
+let prefill = GdnPrefill::new(
+    &handle,
+    &device,
+    GdnPrefillConfig::new(query_heads, value_heads, 128, 128),
+)?;
+```
+
+Prepare from the query's leading token dimension and int32 `cu_seqlens: [B+1]`,
+then launch through the architecture-independent input type:
+
+```rust
+use candle_flashinfer_gdn::PrefillInputs;
+
+let plan = prefill.prepare(&q, &cu_seqlens)?;
+let output = plan.forward(&PrefillInputs {
+    state: &state,
+    state_indices: &state_indices,
+    q: &q,
+    k: &k,
+    v: &v,
+    alpha: &alpha,
+    beta: &beta,
+    cu_seqlens: &cu_seqlens,
+    state_checkpoints: None,
+    checkpoint_cu_starts: None,
+})?;
+```
+
+The output is `[N,HV,V]` BF16 and the selected state slots are updated in place.
+SM100/SM103 passes the BF16 pool and indices directly to FlashInfer. SM90 and
+SM120/SM121 use plan-owned compact float32 state; `forward` performs a fused
+gather/cast before the kernel and a fused scatter/cast afterward.
+
+Checkpointed prefill is selected when preparing the launch-specific plan:
+
+```rust
+let plan = prefill.prepare_checkpointed(
+    &q,
+    &cu_seqlens,
+    checkpoint_every_n_tokens,
+    total_checkpoints,
+)?;
+```
+
+For that configuration, every `forward` supplies a mutable compact BF16
+`state_checkpoints: [C,HV,V,K]` tensor and int32
+`checkpoint_cu_starts: [B+1]`. The main BF16 state remains the full pool selected
+by `state_indices`; checkpoint rows are launch-local and are not persistent pool
+slot indices. The offsets begin at zero, end at `C`, and each sequence contributes
+`floor(sequence_length / checkpoint_every_n_tokens)` rows. This lets the caller scatter/cast only retained rows into its
+persistent checkpoint slots. Context-parallel prefill is not currently bound.
+
 ## State-pool contract
 
 `DecodeInputs::state` is a mutable contiguous BF16 pool shaped `[P,HV,V,K]`.
@@ -165,6 +229,9 @@ dispatch families for each mode:
 ```shell
 cargo run -p candle-flashinfer-gdn --bin bf16-state-decode
 cargo run -p candle-flashinfer-gdn --bin bf16-state-mtp
+cargo run -p candle-flashinfer-gdn --bin gdn-prefill
+GDN_PREFILL_CHECKPOINTS=1 \
+  cargo run -p candle-flashinfer-gdn --bin gdn-prefill
 ```
 
 ## License

@@ -1,5 +1,5 @@
 #![deny(unsafe_op_in_unsafe_fn)]
-//! Candle CUDA integration for FlashInfer BF16-state GDN decode.
+//! Candle CUDA integration for FlashInfer GDN decode and prefill.
 //!
 //! Preparation performs all compilation, loading, and auxiliary allocation before
 //! CUDA Graph capture. Eager execution and capture use each plan's `forward`
@@ -11,11 +11,13 @@ use candle::cuda_backend::CudaDevice;
 use candle::cuda_backend::cudarc::driver::sys::CUdevice_attribute;
 
 pub mod decode;
+pub mod prefill;
 mod raw_tensor;
 mod state_pool;
 
 pub use decode::{DecodeInputs, DecodePlan, GdnDecode, GdnDecodeConfig};
 pub use flashinfer_gdn::GdnHandle;
+pub use prefill::{GdnPrefill, GdnPrefillConfig, PrefillInputs, PrefillPlan};
 
 fn device_architecture(device: &CudaDevice) -> Result<String> {
     let (major, minor) = device

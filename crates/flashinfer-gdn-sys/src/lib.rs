@@ -1,5 +1,5 @@
 #![deny(unsafe_op_in_unsafe_fn)]
-//! Raw FlashInfer BF16-state GDN decode specialization and entrypoint integration.
+//! Raw FlashInfer GDN decode/prefill specialization and entrypoint integration.
 //!
 //! This crate owns the versioned CuTeDSL shims and the unsafe boundary between
 //! GDN-specific argument schemas and `cutedsl-jit` modules. It intentionally does
@@ -19,6 +19,7 @@ use serde_json::{Value, json};
 
 mod bf16_state_decode;
 mod bf16_state_mtp;
+mod prefill;
 
 pub use bf16_state_decode::{
     Bf16StateDecodeKernel, Bf16StateDecodeKernelVariant, Bf16StateDecodeSpecialization,
@@ -26,6 +27,10 @@ pub use bf16_state_decode::{
 };
 pub use bf16_state_mtp::{
     Bf16StateMtpKernel, Bf16StateMtpKernelVariant, Bf16StateMtpSpecialization, Bf16StateMtpTensors,
+};
+pub use prefill::{
+    PrefillBackend, PrefillSm90Kernel, PrefillSm90Tensors, PrefillSm100Kernel, PrefillSm100Tensors,
+    PrefillSm120Kernel, PrefillSm120Tensors, PrefillSpecialization,
 };
 
 /// Error type shared with the generic artifact runtime.
@@ -212,10 +217,15 @@ mod tests {
                 .join("flashinfer/gdn_kernels/gdn_decode_bf16_state.py")
                 .is_file()
         );
+        assert!(
+            source_root()
+                .join("flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_sm120.py")
+                .is_file()
+        );
     }
 
     #[test]
-    fn one_handle_keys_both_decode_families() {
+    fn one_handle_keys_decode_and_prefill_families() {
         let handle = GdnHandle::from_parts(
             "/unavailable-python-is-valid-for-key-generation",
             "target/test-cutedsl-cache",
@@ -228,6 +238,10 @@ mod tests {
         let mtp = handle
             .bf16_state_mtp_cache_key(&Bf16StateMtpSpecialization::default())
             .unwrap();
+        let prefill =
+            PrefillSpecialization::new(PrefillBackend::Sm120, "sm_121a", 1, 1, 128, 128, 20)
+                .unwrap();
+        let prefill = handle.prefill_sm120_cache_key(&prefill).unwrap();
 
         assert_eq!(single.namespace, "flashinfer-gdn/decode-bf16-state-t1");
         assert_eq!(
@@ -235,5 +249,7 @@ mod tests {
             "flashinfer-gdn/decode-bf16-state-mtp-pool-scatter"
         );
         assert_ne!(single.digest().unwrap(), mtp.digest().unwrap());
+        assert_eq!(prefill.namespace, "flashinfer-gdn/prefill-sm120");
+        assert_ne!(single.digest().unwrap(), prefill.digest().unwrap());
     }
 }

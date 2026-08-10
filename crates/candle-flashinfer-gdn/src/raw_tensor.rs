@@ -52,6 +52,10 @@ impl RawTensor {
         }
         .map_err(core_error)
     }
+
+    pub(crate) const fn address(&self) -> usize {
+        self.address
+    }
 }
 
 pub(crate) fn descriptor(
@@ -114,7 +118,9 @@ pub(crate) fn immutable_address<'a>(
     stream: &'a DriverStream,
 ) -> Result<(usize, SyncOnDrop<'a>)> {
     let (address, guard) = match &storage.slice {
+        CudaStorageSlice::U8(slice) => slice.device_ptr(stream),
         CudaStorageSlice::I32(slice) => slice.device_ptr(stream),
+        CudaStorageSlice::I64(slice) => slice.device_ptr(stream),
         CudaStorageSlice::BF16(slice) => slice.device_ptr(stream),
         CudaStorageSlice::F16(slice) => slice.device_ptr(stream),
         CudaStorageSlice::F32(slice) => slice.device_ptr(stream),
@@ -134,7 +140,9 @@ pub(crate) fn mutable_address<'a>(
 ) -> Result<(usize, SyncOnDrop<'a>)> {
     let dtype = storage_dtype(storage)?;
     let (address, guard) = match &mut storage.slice {
+        CudaStorageSlice::U8(slice) => slice.device_ptr_mut(stream),
         CudaStorageSlice::I32(slice) => slice.device_ptr_mut(stream),
+        CudaStorageSlice::I64(slice) => slice.device_ptr_mut(stream),
         CudaStorageSlice::BF16(slice) => slice.device_ptr_mut(stream),
         CudaStorageSlice::F16(slice) => slice.device_ptr_mut(stream),
         CudaStorageSlice::F32(slice) => slice.device_ptr_mut(stream),
@@ -145,7 +153,9 @@ pub(crate) fn mutable_address<'a>(
 
 pub(crate) fn storage_dtype(storage: &CudaStorage) -> Result<CandleDType> {
     Ok(match storage.slice {
+        CudaStorageSlice::U8(_) => CandleDType::U8,
         CudaStorageSlice::I32(_) => CandleDType::I32,
+        CudaStorageSlice::I64(_) => CandleDType::I64,
         CudaStorageSlice::BF16(_) => CandleDType::BF16,
         CudaStorageSlice::F16(_) => CandleDType::F16,
         CudaStorageSlice::F32(_) => CandleDType::F32,
@@ -169,7 +179,9 @@ pub(crate) fn ensure_ordinal(
 
 fn convert_dtype(dtype: CandleDType) -> Result<DType> {
     Ok(match dtype {
+        CandleDType::U8 => DType::U8,
         CandleDType::I32 => DType::I32,
+        CandleDType::I64 => DType::I64,
         CandleDType::BF16 => DType::BF16,
         CandleDType::F16 => DType::F16,
         CandleDType::F32 => DType::F32,

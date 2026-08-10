@@ -5,7 +5,7 @@ use flashinfer_gdn_sys::{DlDevice, DlDeviceType, DlTensor};
 
 use crate::{Error, Result};
 
-/// Element types currently accepted by the first GDN decode slice.
+/// Element types accepted by the GDN bindings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DType {
     /// IEEE float16.
@@ -16,6 +16,10 @@ pub enum DType {
     F32,
     /// Signed int32.
     I32,
+    /// Signed int64.
+    I64,
+    /// Unsigned byte.
+    U8,
 }
 
 impl DType {
@@ -23,8 +27,10 @@ impl DType {
     #[must_use]
     pub const fn size_in_bytes(self) -> usize {
         match self {
+            Self::U8 => 1,
             Self::F16 | Self::BF16 => 2,
             Self::F32 | Self::I32 => 4,
+            Self::I64 => 8,
         }
     }
 
@@ -35,6 +41,8 @@ impl DType {
             Self::BF16 => DlDataType::scalar(DlDataTypeCode::Bfloat, 16),
             Self::F32 => DlDataType::scalar(DlDataTypeCode::Float, 32),
             Self::I32 => DlDataType::scalar(DlDataTypeCode::Int, 32),
+            Self::I64 => DlDataType::scalar(DlDataTypeCode::Int, 64),
+            Self::U8 => DlDataType::scalar(DlDataTypeCode::UInt, 8),
         }
     }
 }
