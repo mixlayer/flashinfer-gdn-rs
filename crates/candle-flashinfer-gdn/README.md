@@ -1,87 +1,70 @@
 # candle-flashinfer-gdn
 
-Candle integration for the prepared FlashInfer GDN kernels in this workspace. The
-supported `T=1` decode operations are:
+Candle integration for the BF16-state GDN decode kernels in FlashInfer
+0.6.16.post2. This crate intentionally supports only:
 
-- BF16-input, float-state pretransposed `[P,HV,V,K]` pools selected by int32 `[B]`
-  indices;
-- BF16-input, float-state non-transposed `[P,HV,K,V]` compact pools selected by
-  int32 `[B]` indices; and
-- BF16-input, BF16-state `[P,HV,V,K]` compact pools selected and updated in the same
-  slots by int32 `[B]` indices; and
-- checkpointed BF16-state MTP over compile-time `T>=2`, returning `[B,T,HV,V]`
-  while writing `h_1…h_T` to caller-selected slots in the same state pool.
+- single-token (`T=1`) decode; and
+- checkpointed multi-token prediction (`T>=2`) decode.
 
-Non-transposed decode compiles distinct small- (`B<32`) and large-batch (`B>=32`)
-artifacts. Construct its specialization with the same fixed batch passed to
-`NontransposeDecodePlan::prepare`.
+Both operations use BF16 inputs, float32 `a_log` and `dt_bias`, and a contiguous
+V-major BF16 state pool shaped `[P,HV,V,K]`. The pinned kernels require
+`K=V=128`.
 
-Every Candle operation presents the same persistent-pool interface: `state` is a
-compact pool and `state_indices` selects one input state per batch item. Backends
-with native pool indexing receive those tensors directly. Backends with compact
-per-batch state contracts use a graph-stable plan-owned workspace and enqueue a
-device gather, the FlashInfer kernel, and a device scatter on the same CUDA stream.
-Pretranspose selects between those paths from its specialization; nontranspose uses
-the fallback because FlashInfer's public nontranspose API is compact-state only.
-Both float-state decode adapters accept optional `[B]` write indices, defaulting to
-the read indices.
-Pool indices must be nonnegative, in range, and unique within a concurrent write.
+## State-pool interface
 
-BF16-state decode fixes `K=V=128` and compiles the upstream ILP4 or wide-vector
-implementation selected from `B*HV` and the device SM count. Its state pool must be
-compact and 32-byte aligned. The initial adapter intentionally supports same-slot
-updates only; split read/write pools are a separate future kernel variant.
+The Candle API uses one `DecodeInputs` type for both kernels and always accepts the
+main state pool plus contiguous int32 pool indices. This remains the public
+contract across GPU architectures:
 
-BF16-state MTP uses ILP4 below `B*HV=128` and the general wide-vector kernel at or
-above that threshold. `T` is compile-time and part of the artifact key. The initial
-adapter requires `checkpoint_indices: [B,T]`. These entries name mutually distinct,
-fresh slots in the main `[P,HV,V,K]` pool and must not overlap the `[B]` input slots.
-After sampling accepts `A` tokens, retain the input slot for `A=0`; otherwise select
-`checkpoint_indices[b,A-1]` as the request's active state. Accepted-step fused
-recovery and dense intermediate-state caching remain separate specializations.
+- `DecodeInputs::state_indices: [B]` selects each request's input state. The `T=1`
+  kernel updates that same slot.
+- `DecodeInputs::checkpoint_indices: Option<[B,T]>` is `None` for `T=1`. MTP
+  requires it and writes `h_1` through `h_T` into the selected main-pool slots.
 
-The intended lifecycle is:
+FlashInfer's current BF16 kernels implement this indirection natively, so these
+indices pass directly to the compiled kernel. The crate retains a graph-stable
+gather/scatter adapter for a future architecture-specific backend that only accepts
+compact per-batch state. Such a backend can therefore preserve the same public
+pool-plus-indices signature without allocating during a launch.
 
-1. Create a `PretransposeDecodeSpecialization` and `PretransposeDecodeCompiler`.
-2. Call `PretransposeDecodePlan::prepare` before CUDA Graph capture. This may create
-   or load a JIT artifact and allocates the fixed-batch auxiliary tensors.
-3. Call `forward` to allocate and return the output. Use the same call from eager
-   code and from a graph capture body.
-4. Let the surrounding graph runtime perform its usual eager warmup/reference
-   passes, pin buffers, capture, and replay. Keep the plan and captured allocations
-   alive for as long as the graph can execute.
+Concurrent writes must target distinct in-range pool slots. For MTP, checkpoint
+slots must be fresh, mutually distinct, and must not overlap the input slots while
+the kernel is running. After sampling accepts `A` speculative tokens, retain the
+input slot for `A=0`; otherwise use `checkpoint_indices[b,A-1]` as the request's
+active state.
 
-There is no GDN-specific warmup or tensor-binding phase. For capture-capable Candle
-devices, use `Device::new_cuda_with_stream` and disable Candle event tracking before
-capture. `modeld-core` already does both and calls the graph module eagerly before
-capture. Graph owners are also responsible for restoring recurrent state if their
-warmup policy requires it.
+## Dispatch
 
-The deterministic GPU acceptance executable exercises numerical comparison for the
-compact-backend fallback and native indexing, changed input contents, repeated
-graph replay, and a second CUDA stream:
+Construct the appropriate specialization using the fixed runtime batch size before
+preparing its plan. `T` is part of the MTP specialization and artifact cache key.
+The Rust specialization reproduces the pinned upstream dispatch:
 
-```shell
-RUSTFLAGS="-C target-cpu=native" \
-cargo run -p candle-flashinfer-gdn --bin decode-vertical -- \
-  /path/to/managed-env/bin/python \
-  .cutedsl-jit-cache/runtime
-```
+- `T=1` uses ILP4 below `B*HV=512`, then the dedicated wide-vector kernel.
+- MTP uses ILP4 below `B*HV=128`, then the general wide-vector kernel.
 
-The `target-cpu` setting is needed by the current Candle CPU GEMM dependency on the
-aarch64 GB10 development host; it is not part of the GDN artifact cache contract.
+Tile selection inside each family also follows FlashInfer and is validated when a
+plan is prepared.
 
-The eager-only non-transposed acceptance test covers both FlashInfer batch classes:
+## Lifecycle
 
-```shell
-RUSTFLAGS="-C target-cpu=native" \
-cargo run -p candle-flashinfer-gdn --bin nontranspose-decode -- \
-  /path/to/managed-env/bin/python \
-  .cutedsl-jit-cache/runtime
-```
+1. Create a `Bf16StateDecodeSpecialization` or `Bf16StateMtpSpecialization` for
+   the device architecture and fixed batch.
+2. Create the matching compiler and pass it to `DecodePlan::prepare` before CUDA
+   Graph capture. The compiler type selects the `T=1` or MTP backend. Preparation
+   compiles or loads the content-addressed artifact and allocates fixed auxiliary
+   tensors.
+3. Call `DecodePlan::forward` with `DecodeInputs` from eager code or a graph capture
+   body.
+4. Keep the plan and captured allocations alive for as long as the graph may run.
 
-The eager-only BF16-state acceptance test covers both the ILP4 and wide-vector
-dispatch families with indexed pools:
+There is no GDN-specific warmup or tensor-binding phase. The surrounding graph
+runtime remains responsible for its normal eager warmup, capture, replay, and any
+state restoration its warmup policy requires.
+
+## Acceptance executables
+
+The eager BF16 `T=1` acceptance executable covers the ILP4 and wide-vector dispatch
+families with indexed pools:
 
 ```shell
 RUSTFLAGS="-C target-cpu=native" \
@@ -90,8 +73,8 @@ cargo run -p candle-flashinfer-gdn --bin bf16-state-decode -- \
   .cutedsl-jit-cache/runtime
 ```
 
-The eager-only BF16-state MTP acceptance test covers the ILP4 and general
-wide-vector dispatch families at `T=2`, including every checkpoint pool write:
+The MTP executable covers both dispatch families at `T=2`, including every
+checkpoint write:
 
 ```shell
 RUSTFLAGS="-C target-cpu=native" \
@@ -99,3 +82,6 @@ cargo run -p candle-flashinfer-gdn --bin bf16-state-mtp -- \
   /path/to/managed-env/bin/python \
   .cutedsl-jit-cache/runtime
 ```
+
+The `target-cpu` setting is needed by the current Candle CPU GEMM dependency on the
+aarch64 GB10 development host; it is not part of the GDN artifact cache contract.

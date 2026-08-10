@@ -1,5 +1,5 @@
 #![deny(unsafe_op_in_unsafe_fn)]
-//! Candle CUDA integration for FlashInfer GDN kernels.
+//! Candle CUDA integration for FlashInfer BF16-state GDN decode.
 //!
 //! Preparation performs all compilation, loading, and auxiliary allocation before
 //! CUDA Graph capture. Eager execution and capture use each plan's `forward`
@@ -16,21 +16,14 @@ use candle::cuda_backend::{CudaDevice, CudaStorage, CudaStorageSlice};
 use candle::{DType as CandleDType, Layout, Result, Storage, Tensor};
 use flashinfer_gdn::{CudaTensor, DType};
 
-mod bf16_state_decode;
-mod bf16_state_mtp;
-mod nontranspose_decode;
-mod pretranspose_decode;
+pub mod decode;
 mod state_pool;
 
-pub use bf16_state_decode::{Bf16StateDecodeInputs, Bf16StateDecodePlan};
-pub use bf16_state_mtp::{Bf16StateMtpInputs, Bf16StateMtpPlan};
+pub use decode::{DecodeCompiler, DecodeInputs, DecodePlan};
 pub use flashinfer_gdn::{
     Bf16StateDecodeCompiler, Bf16StateDecodeKernelVariant, Bf16StateMtpCompiler,
-    Bf16StateMtpKernelVariant, DtBiasDType, InputDType, NontransposeDecodeBatchClass,
-    NontransposeDecodeCompiler, PretransposeDecodeCompiler,
+    Bf16StateMtpKernelVariant, DtBiasDType, InputDType,
 };
-pub use nontranspose_decode::{NontransposeDecodeInputs, NontransposeDecodePlan};
-pub use pretranspose_decode::{PretransposeDecodeInputs, PretransposeDecodePlan};
 
 #[derive(Debug, Clone)]
 struct RawTensor {
@@ -74,14 +67,6 @@ impl RawTensor {
             )
         }
         .map_err(core_error)
-    }
-
-    fn effective_address(&self, name: &'static str) -> Result<usize> {
-        let offset = usize::try_from(self.byte_offset)
-            .map_err(|_| message(format!("{name} byte offset does not fit usize")))?;
-        self.address
-            .checked_add(offset)
-            .ok_or_else(|| message(format!("{name} effective CUDA address overflows usize")))
     }
 }
 
@@ -203,19 +188,6 @@ fn byte_offset(dtype: CandleDType, layout: &Layout, name: &'static str) -> Resul
         .checked_mul(dtype.size_in_bytes())
         .ok_or_else(|| message(format!("{name} byte offset overflows usize")))?;
     u64::try_from(bytes).map_err(|_| message(format!("{name} byte offset does not fit u64")))
-}
-
-fn effective_address(
-    address: usize,
-    dtype: CandleDType,
-    layout: &Layout,
-    name: &'static str,
-) -> Result<usize> {
-    let offset = usize::try_from(byte_offset(dtype, layout, name)?)
-        .map_err(|_| message(format!("{name} byte offset does not fit usize")))?;
-    address
-        .checked_add(offset)
-        .ok_or_else(|| message(format!("{name} effective CUDA address overflows usize")))
 }
 
 fn ensure_ordinal(storage: &CudaStorage, expected: i32, name: &'static str) -> Result<()> {

@@ -5,20 +5,8 @@ use std::process::Command;
 const FLASHINFER_VERSION: &str = "0.6.16.post2";
 const FLASHINFER_GIT_REV: &str = "c498513a891d424e9ebb2518a1a3c53122dbf257";
 
-const REQUIRED_SOURCE_FILES: &[&str] = &[
-    "LICENSE",
-    "flashinfer/gdn_decode.py",
-    "flashinfer/gdn_prefill.py",
-    "flashinfer/gdn_kernels/gdn_decode_pretranspose.py",
-    "flashinfer/gdn_kernels/gdn_decode_nontranspose.py",
-    "flashinfer/gdn_kernels/gdn_decode_mtp.py",
-    "flashinfer/gdn_kernels/gdn_decode_bf16_state.py",
-    "flashinfer/gdn_kernels/blackwell/gdn_prefill.py",
-    "flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_sm90.py",
-    "flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_sm120.py",
-    "flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_cp_sm90.py",
-    "flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_cp_sm120.py",
-];
+const REQUIRED_SOURCE_FILES: &[&str] =
+    &["LICENSE", "flashinfer/gdn_kernels/gdn_decode_bf16_state.py"];
 
 fn main() {
     println!("cargo:rerun-if-env-changed=FLASHINFER_ROOT");

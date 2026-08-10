@@ -5,8 +5,8 @@ use flashinfer_gdn_sys::{
     Bf16StateDecodeTensors,
 };
 
-use crate::decode::{bounds_overlap, check_rank, expect};
 use crate::tensor::DlTensorOwner;
+use crate::validation::{bounds_overlap, check_rank, expect};
 use crate::{CudaStream, CudaTensor, DType, Error, Result};
 
 /// Tensor arguments for one same-slot BF16-state decode launch.

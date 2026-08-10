@@ -4,8 +4,8 @@ use flashinfer_gdn_sys::{
     Bf16StateMtpCompiler, Bf16StateMtpKernel, Bf16StateMtpSpecialization, Bf16StateMtpTensors,
 };
 
-use crate::decode::{bounds_overlap, check_rank, expect};
 use crate::tensor::DlTensorOwner;
+use crate::validation::{bounds_overlap, check_rank, expect};
 use crate::{CudaStream, CudaTensor, DType, Error, Result};
 
 /// Tensor arguments for one checkpointed BF16-state MTP launch.

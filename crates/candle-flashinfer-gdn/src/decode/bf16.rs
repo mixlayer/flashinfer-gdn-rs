@@ -1,56 +1,32 @@
 use candle::cuda_backend::{CudaDevice, CudaStorage};
 use candle::{CpuStorage, DType as CandleDType, Device, InplaceOp1, Layout, Result, Tensor};
 use flashinfer_gdn::{
-    Bf16StateMtpCall, Bf16StateMtpCompiler as CoreCompiler, Bf16StateMtpPlan as CorePlan,
-    Bf16StateMtpSpecialization, CudaStream,
+    Bf16StateDecodeCall, Bf16StateDecodeCompiler as CoreCompiler, Bf16StateDecodePlan as CorePlan,
+    Bf16StateDecodeSpecialization, CudaStream,
 };
 
+use super::DecodeInputs;
 use crate::{
     RawTensor, base_address, core_error, cuda_storage, descriptor, descriptor_parts,
-    device_architecture, ensure_ordinal, immutable_address, message, mutable_address,
-    state_pool::validate_indexed_state_pool, storage_dtype,
+    device_architecture, device_multiprocessor_count, ensure_ordinal, immutable_address, message,
+    mutable_address, state_pool::validate_indexed_state_pool, storage_dtype,
 };
 
-/// Candle tensors consumed by checkpointed BF16-state MTP.
-///
-/// `state` is a V-major `[P,HV,V,K]` BF16 pool and is mutated in place.
-pub struct Bf16StateMtpInputs<'a> {
-    /// Main state pool `[P,HV,V,K]`, BF16.
-    pub state: &'a Tensor,
-    /// Log-decay parameter `[HV]`, float32.
-    pub a_log: &'a Tensor,
-    /// Input-dependent decay `[B,T,HV]`, BF16.
-    pub a: &'a Tensor,
-    /// Decay bias `[HV]`, float32.
-    pub dt_bias: &'a Tensor,
-    /// Query `[B,T,H,K]`, BF16.
-    pub q: &'a Tensor,
-    /// Key `[B,T,H,K]`, BF16.
-    pub k: &'a Tensor,
-    /// Value `[B,T,HV,V]`, BF16.
-    pub v: &'a Tensor,
-    /// Update gate `[B,T,HV]`, BF16.
-    pub beta: &'a Tensor,
-    /// Int32 `[B]` state-pool indices used to read `h_0`.
-    pub state_indices: &'a Tensor,
-    /// Int32 `[B,T]` main-pool slots receiving `h_1` through `h_T`.
-    pub checkpoint_indices: &'a Tensor,
-}
-
-/// Prepared Candle adapter for BF16-state MTP and a fixed batch size.
+/// Prepared Candle adapter for BF16-state T=1 decode and a fixed batch size.
 #[derive(Debug)]
-pub struct Bf16StateMtpPlan {
+pub(super) struct Plan {
     core: CorePlan,
     device: CudaDevice,
     batch: usize,
     accepted_steps: Tensor,
+    ssm_state_indices: Tensor,
 }
 
-impl Bf16StateMtpPlan {
+impl Plan {
     /// Compiles or loads the upstream-selected specialization and allocates auxiliaries.
     pub fn prepare(compiler: &CoreCompiler, device: &CudaDevice, batch: usize) -> Result<Self> {
         if batch == 0 {
-            return Err(message("MTP batch size must be positive"));
+            return Err(message("decode batch size must be positive"));
         }
         let ordinal = device.cuda_stream().context().ordinal();
         let device_id = i32::try_from(ordinal)
@@ -63,9 +39,13 @@ impl Bf16StateMtpPlan {
                 specialization.gpu_arch
             )));
         }
-        if !specialization.matches_runtime(batch).map_err(message)? {
+        let num_sms = device_multiprocessor_count(device)?;
+        if !specialization
+            .matches_runtime(batch, num_sms)
+            .map_err(message)?
+        {
             return Err(message(format!(
-                "BF16-state MTP specialization {:?}/tile_v={} does not match upstream dispatch for batch {batch} and HV={}",
+                "BF16-state specialization {:?}/tile_v={} does not match upstream dispatch for batch {batch}, HV={}, and {num_sms} SMs",
                 specialization.variant, specialization.tile_v, specialization.hv
             )));
         }
@@ -73,17 +53,19 @@ impl Bf16StateMtpPlan {
         let core = CorePlan::prepare(compiler, device_id).map_err(core_error)?;
         let candle_device = Device::Cuda(device.clone());
         let accepted_steps = Tensor::zeros(batch, CandleDType::I32, &candle_device)?;
+        let ssm_state_indices = Tensor::zeros((batch, 1), CandleDType::I32, &candle_device)?;
         Ok(Self {
             core,
             device: device.clone(),
             batch,
             accepted_steps,
+            ssm_state_indices,
         })
     }
 
     /// The compile-time specialization selected by this plan.
     #[must_use]
-    pub fn specialization(&self) -> &Bf16StateMtpSpecialization {
+    pub fn specialization(&self) -> &Bf16StateDecodeSpecialization {
         self.core.specialization()
     }
 
@@ -102,14 +84,14 @@ impl Bf16StateMtpPlan {
     fn empty_output(&self) -> Result<Tensor> {
         let spec = self.specialization();
         Tensor::zeros(
-            (self.batch, spec.t, spec.hv, spec.v),
+            (self.batch, 1, spec.hv, spec.v),
             CandleDType::BF16,
             &Device::Cuda(self.device.clone()),
         )
     }
 
-    /// Runs BF16-state MTP and returns `[B,T,HV,V]` BF16 output.
-    pub fn forward(&self, inputs: &Bf16StateMtpInputs<'_>) -> Result<Tensor> {
+    /// Runs BF16-state GDN decode and returns the BF16 output.
+    pub fn forward(&self, inputs: &DecodeInputs<'_>) -> Result<Tensor> {
         let spec = self.specialization();
         validate_indexed_state_pool(
             inputs.state,
@@ -128,11 +110,7 @@ impl Bf16StateMtpPlan {
         Ok(output)
     }
 
-    fn validate_mutable_aliases(
-        &self,
-        inputs: &Bf16StateMtpInputs<'_>,
-        output: &Tensor,
-    ) -> Result<()> {
+    fn validate_mutable_aliases(&self, inputs: &DecodeInputs<'_>, output: &Tensor) -> Result<()> {
         let stream = self.device.cuda_stream();
         let state = base_address(inputs.state, &stream, "state")?;
         let output_address = base_address(output, &stream, "output")?;
@@ -148,8 +126,8 @@ impl Bf16StateMtpPlan {
             ("v", inputs.v),
             ("beta", inputs.beta),
             ("state_indices", inputs.state_indices),
-            ("checkpoint_indices", inputs.checkpoint_indices),
             ("accepted_steps", &self.accepted_steps),
+            ("ssm_state_indices", &self.ssm_state_indices),
         ] {
             let address = base_address(tensor, &stream, name)?;
             if address == state {
@@ -168,18 +146,18 @@ impl Bf16StateMtpPlan {
 }
 
 struct StateLaunch<'a> {
-    plan: &'a Bf16StateMtpPlan,
-    inputs: &'a Bf16StateMtpInputs<'a>,
+    plan: &'a Plan,
+    inputs: &'a DecodeInputs<'a>,
     output: &'a Tensor,
 }
 
 impl InplaceOp1 for StateLaunch<'_> {
     fn name(&self) -> &'static str {
-        "flashinfer-gdn-bf16-state-mtp-state"
+        "flashinfer-gdn-bf16-state-decode-state"
     }
 
     fn cpu_fwd(&self, _storage: &mut CpuStorage, _layout: &Layout) -> Result<()> {
-        Err(message("FlashInfer GDN MTP requires CUDA storage"))
+        Err(message("FlashInfer GDN decode requires CUDA storage"))
     }
 
     fn cuda_fwd(&self, storage: &mut CudaStorage, layout: &Layout) -> Result<()> {
@@ -207,11 +185,11 @@ struct OutputLaunch<'a, 'b> {
 
 impl InplaceOp1 for OutputLaunch<'_, '_> {
     fn name(&self) -> &'static str {
-        "flashinfer-gdn-bf16-state-mtp-output"
+        "flashinfer-gdn-bf16-state-decode-output"
     }
 
     fn cpu_fwd(&self, _storage: &mut CpuStorage, _layout: &Layout) -> Result<()> {
-        Err(message("FlashInfer GDN MTP requires CUDA storage"))
+        Err(message("FlashInfer GDN decode requires CUDA storage"))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -231,9 +209,8 @@ impl InplaceOp1 for OutputLaunch<'_, '_> {
         let (beta_storage, beta_layout) = self.parent.inputs.beta.storage_and_layout();
         let (state_indices_storage, state_indices_layout) =
             self.parent.inputs.state_indices.storage_and_layout();
-        let (checkpoint_indices_storage, checkpoint_indices_layout) =
-            self.parent.inputs.checkpoint_indices.storage_and_layout();
         let (accepted_storage, accepted_layout) = plan.accepted_steps.storage_and_layout();
+        let (scatter_storage, scatter_layout) = plan.ssm_state_indices.storage_and_layout();
 
         let a_log_storage = cuda_storage(&a_log_storage, "a_log")?;
         let a_storage = cuda_storage(&a_storage, "a")?;
@@ -243,9 +220,8 @@ impl InplaceOp1 for OutputLaunch<'_, '_> {
         let v_storage = cuda_storage(&v_storage, "v")?;
         let beta_storage = cuda_storage(&beta_storage, "beta")?;
         let state_indices_storage = cuda_storage(&state_indices_storage, "state_indices")?;
-        let checkpoint_indices_storage =
-            cuda_storage(&checkpoint_indices_storage, "checkpoint_indices")?;
         let accepted_storage = cuda_storage(&accepted_storage, "accepted_steps")?;
+        let scatter_storage = cuda_storage(&scatter_storage, "ssm_state_indices")?;
         for (name, storage) in [
             ("a_log", a_log_storage),
             ("a", a_storage),
@@ -255,8 +231,8 @@ impl InplaceOp1 for OutputLaunch<'_, '_> {
             ("v", v_storage),
             ("beta", beta_storage),
             ("state_indices", state_indices_storage),
-            ("checkpoint_indices", checkpoint_indices_storage),
             ("accepted_steps", accepted_storage),
+            ("ssm_state_indices", scatter_storage),
         ] {
             ensure_ordinal(storage, plan.core.device_id(), name)?;
         }
@@ -270,9 +246,8 @@ impl InplaceOp1 for OutputLaunch<'_, '_> {
         let (beta_ptr, _beta_use) = immutable_address(beta_storage, &stream)?;
         let (state_indices_ptr, _state_indices_use) =
             immutable_address(state_indices_storage, &stream)?;
-        let (checkpoint_indices_ptr, _checkpoint_indices_use) =
-            immutable_address(checkpoint_indices_storage, &stream)?;
         let (accepted_ptr, _accepted_use) = immutable_address(accepted_storage, &stream)?;
+        let (scatter_ptr, _scatter_use) = immutable_address(scatter_storage, &stream)?;
 
         let mut state = self.state.descriptor()?;
         let a_log = descriptor(a_log_ptr, a_log_storage, a_log_layout, "a_log")?;
@@ -301,13 +276,13 @@ impl InplaceOp1 for OutputLaunch<'_, '_> {
             accepted_layout,
             "accepted_steps",
         )?;
-        let checkpoint_indices = descriptor(
-            checkpoint_indices_ptr,
-            checkpoint_indices_storage,
-            checkpoint_indices_layout,
-            "checkpoint_indices",
+        let ssm_state_indices = descriptor(
+            scatter_ptr,
+            scatter_storage,
+            scatter_layout,
+            "ssm_state_indices",
         )?;
-        let mut call = Bf16StateMtpCall {
+        let mut call = Bf16StateDecodeCall {
             state: &mut state,
             a_log: &a_log,
             a: &a,
@@ -319,7 +294,7 @@ impl InplaceOp1 for OutputLaunch<'_, '_> {
             output: &mut output,
             state_indices: &state_indices,
             accepted_steps: &accepted_steps,
-            checkpoint_indices: &checkpoint_indices,
+            ssm_state_indices: &ssm_state_indices,
         };
         // SAFETY: the stream is owned by the plan's Candle device and remains live.
         let cuda_stream = unsafe { CudaStream::from_raw(stream.cu_stream().cast()) };

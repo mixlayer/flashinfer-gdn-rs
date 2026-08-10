@@ -102,7 +102,12 @@ pub(crate) fn validate_state_indices(
 
 /// Graph-stable compact state storage used when an upstream kernel only accepts
 /// one state per batch item.
+///
+/// The current BF16 kernels index pools natively. This workspace is retained so
+/// future architecture-specific backends can preserve the same public pool-plus-
+/// indices contract without adding launch-time allocation.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub(crate) struct IndexedStateWorkspace {
     compact: Tensor,
     gather: CudaFunction,
@@ -112,6 +117,7 @@ pub(crate) struct IndexedStateWorkspace {
     grid_blocks: u32,
 }
 
+#[allow(dead_code)]
 impl IndexedStateWorkspace {
     pub(crate) fn new(
         device: &CudaDevice,

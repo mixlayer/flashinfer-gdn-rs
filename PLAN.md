@@ -1,623 +1,223 @@
 # flashinfer-gdn-rs implementation plan
 
-## Status
+## Scope
 
-The workspace, generic TVM artifact runtime, and four decode paths are implemented.
-The pinned pretransposed and non-transposed float-state kernels and BF16-state
-single-token and checkpointed MTP kernels can be projected from upstream source,
-compiled through a Rust-owned content-addressed cache, loaded behind validated safe
-Rust plans, and called with Candle CUDA tensors. The Candle layer exposes indexed
-state pools uniformly: native indexing is used where available and a reusable
-device gather/scatter fallback adapts compact-state kernels. Pretransposed indexed
-state pools have nonzero numerical coverage plus CUDA Graph capture and replay on
-SM121a. Non-transposed indexed float-state pools, same-slot indexed
-BF16-state pools, and per-token MTP checkpoint scatter have eager numerical coverage
-across their upstream dispatch families. Accepted-prefix fused recovery, split-pool
-writes, and prefill coverage remain pending.
+This workspace is a deliberately narrow Rust integration for the BF16-state GDN
+decode kernels in **FlashInfer 0.6.16.post2** (`v0.6.16.post2`, commit
+`c498513a891d424e9ebb2518a1a3c53122dbf257`). It supports two operations:
 
-The initial source baseline is **FlashInfer 0.6.16.post2**, Git tag
-`v0.6.16.post2`, commit `c498513a891d424e9ebb2518a1a3c53122dbf257`.
+1. same-slot single-token decode (`T=1`); and
+2. checkpointed multi-token-prediction decode (`T>=2`).
 
-The initial implementation will use CuTeDSL's generated **TVM FFI ABI** for all
-FlashInfer GDN kernels. The reusable JIT layer will leave room for a CuTe packed-ABI
-backend, but implementing or maintaining two GDN ABI paths is not part of the first
-release.
+Both paths are implemented end to end: a pinned CuTeDSL source projection, a
+content-addressed compiler cache, a typed TVM FFI boundary, safe Rust validation,
+and Candle tensor adapters.
 
-Decode is expected to run under CUDA Graphs in common deployments. Consequently,
-the design optimizes for safe compilation, stable graph capture, and cache reuse;
-shaving a small amount of host-side dispatch work from each eager invocation is not
-a sufficient reason to replace TVM FFI's generated tensor validation with a custom
-packed ABI.
+The following are out of scope for this crate's initial integration:
 
-## Goals
+- FP32-state pretransposed or non-transposed decode;
+- chunked or context-parallel prefill;
+- split read/write state pools;
+- PyTorch adapters;
+- a second CuTe packed-ABI launch path; and
+- direct integration into `modeld-core` or Qwen 3.5.
 
-- Bind FlashInfer's Gated Delta Network (GDN) decode and prefill kernels from Rust.
-- Compile CuTeDSL shims ahead of first use for the requested specialization and GPU.
-- Cache loadable native artifacts on the host and reuse them across processes.
-- Keep the compilation, artifact, cache, and loading machinery reusable by other
-  CuTeDSL libraries.
-- Provide a framework-independent safe Rust API and a separate Candle adapter.
-- Make decode APIs composable with an external CUDA Graph warmup, capture, and
-  replay lifecycle.
-- Preserve upstream kernel behavior and specialization choices instead of porting
-  the kernels or launch policy to Rust.
+Those kernels can be reconsidered after the decode integration is deployed. They
+must not complicate the current public API, build inputs, or test matrix.
 
-## Non-goals for the first release
-
-- Shipping a complete matrix of precompiled kernels.
-- Reimplementing CuTeDSL, FlashInfer's kernel selection, or TVM FFI.
-- Calling Python or invoking a compiler from the steady-state launch path.
-- Supporting PyTorch tensors directly.
-- Implementing both TVM FFI and CuTe packed invocation for every GDN kernel.
-- Hiding distributed setup for context-parallel prefill behind the local kernel API.
-
-## Terminology
-
-- **Chunked prefill** processes a sequence in bounded token chunks and carries GDN
-  state between chunks.
-- **CP prefill** means context-parallel prefill. It distributes sequence work across
-  ranks; it is not another name for chunked prefill.
-- **Specialization** is one compiled combination of kernel, GPU architecture,
-  compile-time dimensions, dtypes, optional features, and relevant layout choices.
-- **Artifact** is the complete loadable output and metadata for one specialization.
-  With TVM FFI, the primary runtime artifact is a host shared library containing the
-  generated TVM wrapper and embedded/lowered device code. A cubin alone is not
-  sufficient because it does not contain the TVM host entrypoint.
-
-## Decisions
-
-### TVM FFI is the initial GDN ABI
-
-FlashInfer already compiles its GDN paths with `--enable-tvm-ffi`. GDN uses dynamic
-shapes and strides, optional state/checkpoint tensors, explicit streams, and several
-specialization-dependent layouts. The generated TVM wrapper gives us:
-
-- a uniform `DLTensor` representation for framework-owned tensors;
-- generated dtype, device, rank, shape, stride, and alignment checks;
-- explicit representation of optional arguments;
-- structured error propagation; and
-- behavior that follows the upstream Python implementation.
-
-The CuTe packed ABI has a smaller raw call boundary, but its tensor structs and
-argument list are specialization-specific. Using it for GDN would require generated
-Rust packers plus our own exact copy of every layout constraint. That cost is not
-justified by an unmeasured eager-launch saving, particularly for graph-replayed
-decode.
-
-This is an ABI decision, not a decision to expose TVM types publicly. We will keep a
-narrow internal TVM layer and source raw C layouts from official TVM FFI headers or
-a suitable upstream raw-bindings crate. We will not hand-maintain approximations of
-the ABI.
-
-### Streams remain explicit
-
-Current GDN entrypoints take a `cuda.CUstream` explicitly. The Rust API will do the
-same and will not depend on TVM's thread-local environment stream. This keeps launch
-ordering visible and makes integration with Candle and CUDA Graph capture direct.
-
-### The artifact cache stores linked modules
-
-The compilation worker will export the generated host object and link it into a
-loadable shared library against the matching CuTeDSL and TVM FFI runtimes. The cache
-may retain cubin/PTX and generated headers for inspection, but the linked module and
-manifest are the runtime contract.
-
-### JIT is out of process
-
-CuTeDSL is a Python compiler stack. A short-lived Python worker will perform imports,
-specialization, compilation, export, and host linking. The Rust process communicates
-through a versioned request/result format and never embeds Python. This isolates
-compiler failures and prevents Python runtime state from entering the launch path.
-
-### Python dependencies use an isolated managed environment
-
-Cargo's build script will not run pip, modify the invoking Python installation, or
-download a platform toolchain. Build scripts may run during cross-compilation and in
-offline or sandboxed builds, and their outputs are not a suitable home for a runtime
-compiler environment.
-
-On an artifact cache miss, an explicit `prepare` operation will ensure that a pinned
-compiler environment exists. The default environment lives alongside the CuTeDSL
-cache, keyed by a lockfile digest, Python ABI, target platform, architecture, and CUDA
-major version:
-
-```text
-$XDG_CACHE_HOME/cutedsl-jit/
-├── envs/<environment-digest>/
-└── artifacts/<artifact-digest>/
-```
-
-Environment installation follows these rules:
-
-- Locate a compatible host Python executable; do not install Python itself.
-- Create a new staging venv and install a platform-specific, fully pinned lock with
-  `python -m pip --only-binary=:all: --require-hashes`.
-- Validate imports and exact versions, write a completion manifest, and atomically
-  publish the environment. A per-digest lock prevents concurrent pip installs.
-- Never upgrade or repair an environment in place. A changed lock produces a new
-  digest and a new immutable environment.
-- Never invoke pip, Python, or the compiler from the steady-state launch path or
-  while a CUDA stream is being captured.
-- Preserve installer output in a log and return an actionable error on unavailable
-  wheels, network failure, disk exhaustion, or version mismatch.
-
-The lock is intentionally smaller than FlashInfer's general `requirements.txt`. We
-will not install the `flashinfer-python` project because the pinned Cargo-provided
-source tree is the compiler input. The first tested lock contains:
-
-- CPython 3.12 on aarch64;
-- `nvidia-cutlass-dsl[cu13]` 4.7.0;
-- `apache-tvm-ffi` 0.1.13.post2;
-- `cuda-python` 13.3.1; and
-- fully hashed binary-only transitive dependencies.
-
-PyTorch is not required for the first pretransposed decode specialization. The shim
-parses the exact pinned upstream module, selects top-level kernel and launch-JIT
-definitions before the Torch-facing compiler-helper boundary, removes the otherwise
-unused import, and emits that projection as `kernel_source.py` in the artifact. It
-fails if the expected boundary moves or the selected AST references Torch. Both the
-full upstream file and generated projection are content-hashed in the manifest, so
-the relationship remains inspectable. The resulting object was byte-identical to
-one compiled after importing the full module in a Torch-bearing environment.
-
-This is deliberately a version-specific source adapter, not a mock module. Each
-remaining GDN source must be evaluated independently because some query `torch.cuda`
-at module scope. If a later kernel cannot be isolated safely, Torch becomes a
-separate, explicit lock variant rather than an undeclared dependency of this one.
-
-Two deployment overrides are required:
-
-- `CUTEDSL_JIT_PYTHON=/path/to/python` selects a pre-provisioned environment. It is
-  validated but never mutated.
-- An offline mode plus a wheelhouse setting allows administrators to pre-stage all
-  locked wheels. Offline mode fails before compilation if the environment or a
-  required wheel is missing.
-
-A small CLI should expose the same operation as the Rust API so images and hosts can
-run `prepare-toolchain` and precompile known specializations during provisioning.
-Automatic preparation may be convenient in development, but production services
-should normally prepare the environment and artifacts before accepting traffic.
-
-The generated `module.so` depends on CuTeDSL and TVM FFI runtime libraries from this
-environment. Their absolute locations and content digests are recorded in the
-artifact manifest, and the loader opens the validated libraries before the module.
-The environment therefore remains live for as long as its artifacts are used. We
-will only copy those libraries into each artifact if licensing and measured
-deployment needs justify the duplication.
-
-### Feasibility slice results
-
-The first slice was exercised on Linux aarch64, CUDA 13.0, and an SM121a device:
-
-- the hashed lock installs 14 packages and does not include Torch;
-- the managed environment occupies about 584 MB (the exploratory Torch-bearing
-  environment occupied about 1.3 GB);
-- CuTeDSL exported a 62 KB host object and a 70 KB linked module for one BF16-input,
-  float-state, direct-state, `H=HV=16`, `K=V=128`, `T=1` specialization;
-- the linked module has no RPATH/RUNPATH, so the loader must first validate and open
-  the exact manifest-recorded CuTeDSL and TVM runtime libraries;
-- the Python package reports `apache-tvm-ffi` 0.1.13.post2 while its C runtime reports
-  ABI version 0.1.14; the manifest records both values;
-- the Rust loader validated artifact/dependency digests, resolved the generated
-  safe-call symbol, and exercised structured TVM error ownership; and
-- a C++ harness using the official TVM FFI headers launched the generated function
-  with real CUDA `DLTensor` arguments and verified zero output for zero input.
-
-The follow-on runtime slice also established that:
-
-- canonical keys include specialization JSON, named source/shim/lock hashes, the
-  managed environment identity, host target, and host C compiler version;
-- Rust-owned cache keys and completion records use DeepGEMM's 64-bit FNV-1a
-  implementation and exact constants. The compiler manifest's SHA-256 fields are
-  retained as provenance, but Rust does not recompute them on warm debug builds;
-- cold builds run under a per-key interprocess lock, preserve combined worker output,
-  publish through same-filesystem atomic rename, and retain failed staging trees;
-- warm hits validate the completion record, manifest, artifact files, and external
-  runtime libraries without invoking the configured Python executable;
-- corrupt entries are moved to a quarantine directory and rebuilt; and
-- the same cached artifact still passes the native zero-input CUDA launch.
-
-These results establish compiler/export/link/load/launch feasibility. They do not
-yet establish numerical equivalence on nonzero data, CUDA Graph safety, or a stable
-public Rust API.
-
-### First release has one GDN backend
-
-The generic manifest identifies an ABI backend so the cache format can later support
-`cute-packed`. GDN manifests will select `tvm-ffi`; there will not be a runtime ABI
-fallback for the same specialization. A future packed backend should first be proven
-on a small pointer/scalar-oriented kernel such as the relevant MoonEP cases.
-
-## Workspace
+## Workspace responsibilities
 
 ```text
 crates/
 ├── cutedsl-jit/
-│   └── Framework-agnostic compiler worker protocol, artifact manifest, cache,
-│       TVM module loading, and invocation primitives.
+│   └── Framework-independent compiler protocol, artifact cache, manifest
+│       validation, dynamic loading, and TVM FFI primitives.
 ├── flashinfer-gdn-sys/
-│   └── FlashInfer source/shim discovery, GDN specialization schemas, shim
-│       templates, and unsafe typed entrypoint bindings.
+│   └── Pinned FlashInfer source/shim discovery, BF16 decode specialization
+│       schemas, compilation, and unsafe typed entrypoints.
 ├── flashinfer-gdn/
-│   └── Framework-independent validation, launch descriptors, plans, workspace
-│       requirements, and safe GDN operations.
+│   └── Framework-independent tensor contracts, validation, prepared plans, and
+│       explicit-stream launches.
 └── candle-flashinfer-gdn/
-    └── Candle CUDA tensor conversion, allocation, stream extraction, and
-        ergonomic tensor APIs.
+    └── Unified Candle decode dispatch, CUDA tensor conversion, state-pool
+        interface, and in-place state mutation for T=1 and MTP.
 ```
 
-`cutedsl-jit` must not mention GDN or FlashInfer in its artifact model. Conversely,
-kernel signatures and FlashInfer version knowledge stay out of its core cache and
-loader.
+`cutedsl-jit` remains generic so later CuTeDSL integrations can reuse the compiler,
+cache, and loader without depending on GDN or Candle.
 
-## Compilation and load flow
+## Common state-pool contract
 
-1. The safe GDN layer validates the operation and constructs a specialization key.
-2. `flashinfer-gdn-sys` renders a versioned Python shim request for that key.
-3. `cutedsl-jit` canonicalizes the request and computes the cache digest.
-4. On a cache hit, Rust validates the manifest and loads the shared module.
-5. On a miss, Rust takes a per-digest interprocess lock and rechecks the cache.
-6. A Python worker imports the pinned FlashInfer/CuTeDSL sources, creates dynamic
-   tensor layouts, and invokes `cute.compile(..., options="--enable-tvm-ffi")`.
-7. The worker exports the host object and device code, links a shared module, and
-   reports the entrypoint plus dependency metadata.
-8. Rust verifies the result and atomically publishes a completed artifact directory.
-9. The sys layer resolves the TVM safe-call symbol once and holds the loaded module
-   alive for all plans and graph executions that use it.
-
-Compilation errors must preserve the worker log, command, shim digest, and artifact
-staging directory path in the Rust error. A failed or interrupted build must never
-look like a cache hit.
-
-## Artifact manifest and cache key
-
-Each artifact directory should contain at least:
+The Candle boundary is standardized around one contiguous V-major BF16 state pool:
 
 ```text
-manifest.json
-completion.json
-module.so
-build.log
+state:         [P, HV, V, K] BF16
+state_indices: [B]           int32
 ```
 
-Debug configurations may also retain the rendered shim, generated object, cubin,
-PTX, and generated C header.
+The pinned kernels require `K=V=128`. `state_indices[b]` names the input state for
+batch item `b`.
 
-For source-projected kernels such as the first decode slice, `kernel_source.py` is
-also retained and hashed. Runtime library content hashes, the TVM runtime ABI
-version, and the managed environment digest are recorded even though environment
-paths themselves are not portable.
+The same pool-plus-indices contract is retained on every architecture. The current
+BF16 FlashInfer kernels support pool indexing natively, so the adapter passes the
+pool and indices through without a preliminary copy. The Candle crate also retains
+a private, plan-owned gather/scatter workspace for a future backend that accepts
+only compact `[B,...]` state. That fallback allocates at plan preparation time and
+enqueues gather, kernel, and scatter operations on the plan's CUDA stream, keeping
+launches graph-capturable and leaving the public input shape unchanged.
 
-Cache-key schema 2 and completion schema 2 use lowercase, 16-digit
-DeepGEMM-compatible FNV-1a digests. `completion.json` names the digest algorithm and
-records independent digests for the manifest, each generated artifact, and each
-external runtime library. This keeps corruption detection while avoiding the poor
-debug-build performance of an in-process Rust SHA-256 implementation. The Python
-worker may additionally emit SHA-256 values in `manifest.json`; those are compiler
-provenance rather than the Rust cache-validity contract.
+Writable pool indices must be in range and unique for concurrently executing batch
+items. The Rust layer validates tensor shapes, dtypes, contiguity, device identity,
+and aliasing. Index values reside on the GPU; ownership and collision-free slot
+assignment remain responsibilities of the caller.
 
-The canonical key must include every input that can affect code or ABI:
+The Candle crate exposes one `DecodeInputs` structure and one opaque `DecodePlan`.
+Passing a `Bf16StateDecodeCompiler` or `Bf16StateMtpCompiler` to
+`DecodePlan::prepare` selects the backend. `DecodePlan::forward` dispatches to the
+prepared backend. The only mode-specific input is optional `[B,T]`
+`checkpoint_indices`, which is required for MTP and ignored for `T=1`.
 
-- schema and manifest format versions;
-- library/shim name and shim content digest;
-- FlashInfer source revision or packaged-source digest;
-- CuTeDSL, TVM FFI, CUDA toolkit, and host compiler versions;
-- target triple, libc compatibility, and GPU compute capability;
-- ABI backend and compile/export/link flags;
-- kernel family and all compile-time dimensions, dtypes, feature flags, and layout
-  classes; and
-- hashes of any additional source files consumed by the shim.
+## `T=1` decode
 
-Driver version and visible device identity should be recorded diagnostically. They
-only belong in the key if testing shows that the generated artifact depends on them.
+The Candle input contract is:
 
-The default cache should follow platform cache conventions, with an environment
-override such as `CUTEDSL_JIT_CACHE_DIR`. Publishing uses staging directories,
-`fsync` where appropriate, atomic rename, and per-key file locking. Cache entries are
-immutable after publication.
+```text
+state:         [P, HV, 128, 128] BF16, mutable
+a_log:         [HV]              float32
+a:             [B, 1, HV]        BF16
+dt_bias:       [HV]              float32
+q:             [B, 1, H, 128]    BF16
+k:             [B, 1, H, 128]    BF16
+v:             [B, 1, HV, 128]   BF16
+beta:          [B, 1, HV]        BF16
+state_indices: [B]               int32
+output:        [B, 1, HV, 128]   BF16
+```
 
-## Narrow TVM runtime boundary
+`HV` must be a positive multiple of `H`. The state selected by each index is read
+and updated in the same slot.
 
-The runtime only needs the subset required to invoke exported, void-returning GDN
-functions:
+Specialization construction reproduces FlashInfer's upstream dispatch using the
+fixed batch size, `HV`, and device SM count:
 
-- official `DLDevice`, `DLDataType`, and `DLTensor` layouts;
-- official `TVMFFIAny` and type indices;
-- the generated safe-call function signature;
-- error extraction and reference release; and
-- dynamic loading of the kernel module and matching TVM FFI runtime.
+- `B*HV < 512`: ILP4;
+- `512 <= B*HV < 1024`: dedicated `T=1` wide-vector kernel with `tile_v=64`; and
+- `B*HV >= 1024`: dedicated `T=1` wide-vector kernel with `tile_v=128`.
 
-Inputs and outputs remain owned by the caller. The Candle adapter constructs borrowed
-`DLTensor` views with explicit element strides. We do not create TVM Tensor objects,
-use the TVM global registry, ask TVM to allocate outputs, or transfer DLPack
-ownership. Scalar and stream arguments are packed directly into `TVMFFIAny` values.
+The ILP4 tile calculation also follows the pinned source. The selected family and
+tile are part of the artifact key and are checked again when preparing a Candle
+plan.
 
-The module loader must validate the TVM FFI ABI/runtime version before exposing an
-entrypoint. Loaded modules are process-local and cached behind thread-safe shared
-ownership.
+## MTP decode
 
-## CUDA Graph contract
+MTP adds compile-time `T>=2` and checkpoint destinations:
 
-Graph support is a first-class requirement for decode:
+```text
+a:                  [B, T, HV]        BF16
+q/k:                [B, T, H, 128]    BF16
+v:                  [B, T, HV, 128]   BF16
+beta:               [B, T, HV]        BF16
+checkpoint_indices: [B, T]            int32
+output:              [B, T, HV, 128]  BF16
+```
 
-- JIT compilation, module loading, symbol resolution, and plan-owned auxiliary
-  allocation happen in `prepare`, before the operation is invoked by a graph owner.
-- A prepared plan never starts Python, takes a build lock, or performs file I/O from
-  its launch path.
-- The caller supplies the capture stream explicitly, and every launch uses it.
-- The same launch method is used for eager execution and capture. The GDN crates do
-  not track an internal warmed/capturing state or expose a separate bound launch.
-- Launches perform no device synchronization, device allocation, logging, or file
-  I/O. Host-side descriptor construction and validation remain ordinary launch
-  work.
-- Kernel modules and plan-owned metadata remain alive at least as long as any graph
-  executable that references their kernel nodes.
-- Tensor and workspace addresses used by a captured graph remain stable across
-  replay unless the higher-level graph owner explicitly updates graph parameters.
-- Host-side `DLTensor` descriptors may be temporary: CUDA capture records the values
-  passed to the resulting kernel launches. Device buffers and loaded modules are the
-  objects whose lifetimes must span replay.
-- Plans are associated with a CUDA device and specialization. Reusing a plan on a
-  different device is rejected.
-- Applications prepare every required batch/shape variant before handing execution
-  to their graph runtime.
-- Candle capture must use an explicitly created non-default stream; CUDA does not
-  permit capture on its legacy/default stream. `Device::new_cuda_with_stream` meets
-  this requirement, whereas `Device::new_cuda` does not.
-- Candle's event tracker must be disabled by the graph owner before capture. This is
-  already part of `modeld-core` device initialization and graph tests.
+The remaining inputs and main pool match `T=1`. For each batch item the kernel
+starts from `state_indices[b]` and writes `h_1...h_T` into
+`checkpoint_indices[b,0...T]` in the same pool. Checkpoint slots must be fresh,
+mutually distinct, and non-overlapping with the input slots during the launch.
 
-`modeld-core::cuda_graph::GraphCache` owns the integration lifecycle: it invokes the
-module body eagerly for warmup and reference output, pins graph inputs/outputs, then
-invokes the same body during capture. GDN plan preparation belongs in model setup or
-`GraphModule::prepare_capture`; it is not coupled to those eager passes. Graph tests
-must exercise capture followed by multiple replays with changed input contents,
-optional state pools, and more than one CUDA stream.
+After speculative sampling accepts `A` tokens:
 
-## Initial GDN kernel scope
+- `A=0`: keep the original `state_indices[b]` slot active;
+- `A>0`: make `checkpoint_indices[b,A-1]` the active state; and
+- release the unselected checkpoint slots through the caller's normal pool
+  allocator.
 
-The implementation order is a vertical slice followed by breadth:
+MTP dispatch is:
 
-1. Pretransposed decode with float state, including indexed state pools.
-2. Non-transposed decode.
-3. BF16-state decode and multi-token prediction (MTP) variants.
-4. Chunked prefill for the supported SM90, SM100, and SM120 paths.
-5. Context-parallel prefill for SM90 and SM120. FlashInfer 0.6.16.post2 does not
-   provide an SM100 CP kernel, even though its ordinary chunked prefill supports
-   SM100.
+- `B*HV < 128`: ILP4 with `tile_v=16`;
+- `128 <= B*HV < 512`: wide-vector with `tile_v=32`;
+- `512 <= B*HV < 1024`: wide-vector with `tile_v=64`; and
+- `B*HV >= 1024`: wide-vector with `tile_v=128`.
 
-Each operation starts from the exact upstream Python entrypoint. Its Rust
-specialization schema must distinguish compile-time values from TVM-validated
-runtime values. Optional features that change generated code produce distinct cache
-entries.
+`T`, the kernel family, and tile size all participate in the artifact key.
 
-## Safe API direction
+## Compilation and ABI
 
-`flashinfer-gdn` will accept framework-independent tensor descriptors containing a
-CUDA pointer, device, dtype, shape, and element strides. Its responsibilities are:
+The GDN shims compile with CuTeDSL's generated TVM FFI ABI. The generated wrapper
+provides the DLPack tensor boundary, validation, optional-argument representation,
+explicit CUDA stream argument, and structured error reporting used by the pinned
+FlashInfer implementation. The loadable artifact is a linked host module containing
+the wrapper and lowered device code; a cubin alone is not a complete runtime
+artifact.
 
-- cross-tensor shape and device validation not already expressible in one TVM
-  argument;
-- architecture and specialization selection;
-- output and workspace layout calculation;
-- plan preparation;
-- module lifetime and graph-safety invariants; and
-- forwarding a caller-provided CUDA stream.
+Compilation runs in a short-lived Python subprocess only on an artifact-cache miss.
+There is no Python or compiler work in `forward`, CUDA Graph capture, or replay.
+Cache keys use the same 64-bit FNV-1a scheme as `deepgemm-rs` and include:
 
-`candle-flashinfer-gdn` will verify CUDA storage and contiguous/strided layouts,
-convert Candle offsets into the correct device pointers, allocate outputs when the
-convenience API requests them, and translate errors into Candle errors. It must not
-duplicate kernel selection, cache policy, or the graph owner's lifecycle.
+- the canonical specialization request;
+- compiler shim and helper contents;
+- the exact consumed FlashInfer kernel source;
+- the locked compiler environment identity;
+- host target and C compiler identity; and
+- the selected ABI backend.
 
-The implemented decode plans fix the batch size so their index and `cu_seqlens`
-auxiliaries remain stable across capture. `forward` allocates and returns the output
-for both eager and captured execution. There is no explicit warmup method,
-output-parameter launch, warmed-state bit, capture check, or bound tensor wrapper.
-The external graph owner keeps tensors and the plan alive, supplies stable
-addresses, and disables Candle event tracking. The adapters conservatively reject
-any state or output sharing the same CUDA allocation as another argument; this
-check prevents recursive Candle storage locking and is unrelated to graph
-preparation.
+Cold builds use a per-key interprocess lock and publish atomically. Warm loads
+validate the completion record, manifest, linked module, and external runtime
+libraries without invoking Python. Invalid entries are quarantined and rebuilt.
 
-The Candle APIs standardize recurrent state as a compact four-dimensional pool plus
-required int32 read indices `[B]`. Optional write indices are exposed where the
-kernel semantics support split destinations. Native indexed backends receive the
-pool directly. A reusable, plan-owned compact workspace adapts backends that only
-accept `[B,...]`: a small CUDA utility gathers selected rows, FlashInfer updates the
-workspace, and the utility scatters results back on the same stream. Workspace
-allocation and utility compilation happen during plan preparation, not launch or
-capture. Indices must be nonnegative, in range, and unique within a concurrent
-write; inspecting their GPU values is intentionally not a host-side launch step.
+## FlashInfer source policy
 
-The sys and framework-independent core APIs remain faithful to each FlashInfer
-backend. In particular, non-transposed core decode accepts compact float state
-`[B,HV,K,V]`; its compiler shim projects the pinned source without changing the
-launch grid. The Candle nontranspose plan presents `[P,HV,K,V]` plus indices and
-uses the shared gather/scatter fallback. Pretranspose uses FlashInfer's native
-indexed path when `use_pool_indexing=true` and the same fallback for a direct-state
-specialization. Candle pools are compact; the lower native pretranspose API retains
-its broader K-contiguous strided contract.
+`flashinfer-gdn-sys` resolves its source tree during the dependent Cargo build:
 
-FlashInfer selects two different non-transposed kernels at `B=32`. The batch class
-is part of the specialization and cache key, and both core and Candle plans reject
-a fixed runtime batch belonging to the other class. For the small kernel, `V` must
-be at least 128 and divisible by 128 because its eight blocks divide 16-wide value
-tiles evenly. The large kernel accepts positive multiples of 32.
+1. `FLASHINFER_ROOT`, when explicitly set; otherwise
+2. `crates/flashinfer-gdn-sys/vendor/flashinfer`, pinned to the release commit.
 
-BF16-state T=1 decode accepts a persistent V-major BF16 pool `[P,HV,V,K]` plus
-required int32 indices `[B]`. The initial API passes those indices to both the read
-and write arguments, so each request updates its selected slot in place without a
-host gather. Indices must be in range and unique within a concurrent batch. Split
-read/write pools remain a future variant rather than optional complexity in this
-first single-token plan.
+Only `LICENSE` and `flashinfer/gdn_kernels/gdn_decode_bf16_state.py` are required by
+the reduced build. The consumed source file is included in the artifact digest, and
+the shim checks its expected extraction boundaries. Published crate sources need
+not retain Git metadata; a source checkout that does retain metadata is checked
+against the pinned commit by default.
 
-The pinned BF16-state kernel fixes `K=V=128`, uses BF16 inputs/state/output and a
-float32 decay bias, and requires compact 32-byte-aligned storage. Its upstream
-dispatcher selects ILP4 below `B*HV=512` and a wide-vector T=1 kernel at or above
-that threshold, with tile size also depending on workload and (for ILP4) the actual
-SM count. The selected variant, tile size, and packed-FMA architecture choice are
-compile-time fields in the artifact key. The Candle plan queries the device SM count
-once during preparation and rejects a specialization that does not match upstream;
-launches themselves do not query the device or synchronize.
+## Python dependencies
 
-Checkpointed BF16-state MTP processes compile-time `T>=2` tokens sequentially and
-emits the full `[B,T,HV,V]` output. It reads `h_0` from `[B]` indices into the same
-persistent `[P,HV,V,K]` pool, preserves those input slots, and takes required
-`[B,T]` checkpoint indices naming fresh slots that receive `h_1` through `h_T`.
-After sampling accepts `A` tokens for a request, `A=0` retains its input index and
-`A>0` selects `checkpoint_indices[b,A-1]`; applying the sampling result therefore
-requires no state gather or copy. Unselected checkpoint slots can return to the
-pool allocator.
+Cargo build scripts do not run pip or mutate the invoking Python environment. The
+compiler environment is provisioned explicitly before preparing artifacts:
 
-The upstream MTP dispatcher selects ILP4 with `tile_v=16` below `B*HV=128`, then
-the general wide-vector kernel with `tile_v=32`, `64`, or `128` at work-unit
-thresholds 128, 512, and 1024. `T`, dispatch family, and tile size are artifact-key
-fields. The compact-pool specialization compiles upstream per-token flat scatter
-on, while accepted-prefix fused recovery, dense intermediate caching, and split
-read/write indices remain off. Those remaining modes change generated code or state
-semantics and will be separate specializations.
+```shell
+python3 crates/cutedsl-jit/python/prepare_environment.py \
+  --lock crates/flashinfer-gdn-sys/shims/requirements/cu13-aarch64-py312.lock \
+  --cache-root .cutedsl-jit-cache/compiler
+```
 
-## Source and version policy
+The lock is binary-only, fully hashed, and does not install FlashInfer or PyTorch.
+It contains the CuTeDSL, TVM FFI, and CUDA Python packages needed by the compiler.
+Rust receives the resulting managed Python path and validates its immutable
+`environment.json` identity. Production images should prepare the environment and
+needed artifacts during provisioning rather than on a serving request.
 
-`flashinfer-gdn-sys` pins FlashInfer 0.6.16.post2 at commit
-`c498513a891d424e9ebb2518a1a3c53122dbf257`. Its crate source package will contain
-the required FlashInfer source tree under `vendor/flashinfer`, using the exact pinned
-Git submodule during development and real packaged file contents in a Cargo
-publication. The runtime does not clone FlashInfer or fetch its source over the
-network.
+## CUDA Graph lifecycle
 
-This mirrors the DeepGEMM source handoff:
+Plans are created for a fixed batch before graph capture. Preparation may compile
+or load an artifact and allocates any auxiliary tensors. `forward` has no special
+preflight, warmup, or rebinding API; the application uses the same call in eager and
+capture execution. The surrounding graph owner is responsible for its normal
+warmup, stable tensor addresses, capture/replay, and any recurrent-state restoration
+required by its warmup policy.
 
-1. `flashinfer-gdn-sys/build.rs` starts from `CARGO_MANIFEST_DIR`, which points at the
-   copy Cargo already checked out for the dependent build.
-2. Unless `FLASHINFER_ROOT` is set for development, the selected root is
-   `CARGO_MANIFEST_DIR/vendor/flashinfer`.
-3. The build script canonicalizes the root, checks the expected release metadata and
-   required GDN files, and emits both `cargo:rustc-env` and Cargo metadata containing
-   the selected path.
-4. `flashinfer-gdn-sys` exposes the compiled-in root as the runtime default. A runtime
-   `FLASHINFER_ROOT` override is accepted after the same validation, primarily for
-   source development.
-5. The compiler worker receives the selected root explicitly and loads the required
-   modules without installing the FlashInfer package.
+## Verification and integration milestones
 
-The baked path is appropriate when Cargo builds and runs the dependent on the same
-host or container. A binary copied elsewhere must either carry the source tree and
-set `FLASHINFER_ROOT`, or ship with all required specializations precompiled. This is
-the same portability boundary as any runtime compiler that consumes Cargo-vendored
-source.
+Completed workspace coverage includes:
 
-Artifact manifests always record the release, commit, and actual source-tree digest;
-an override with modified files cannot alias the official-release cache entry.
-CuTeDSL, TVM FFI, and CUDA-facing Python packages are pinned as a tested toolchain
-rather than discovered independently from arbitrary Python environments. Any future
-Torch-bearing lock is a separate environment variant.
+- specialization validation and upstream dispatch boundary tests;
+- artifact-key, cache, corruption, and loader tests in `cutedsl-jit`;
+- safe Rust shape, dtype, device, and alias validation;
+- eager numerical acceptance for `T=1` ILP4 and wide-vector variants using indexed
+  BF16 pools; and
+- eager numerical acceptance for `T=2` ILP4 and wide-vector variants, including all
+  checkpoint writes.
 
-## Testing and acceptance gates
-
-### CPU-only tests
-
-The cache-key ordering, thread/process contention, worker success/nonzero/timeout,
-failure preservation, corruption quarantine/recovery, and atomic hit paths now have
-CPU tests. The remaining CPU gates are:
-
-- canonical manifest fixtures that remain stable across schema evolution;
-- TVM/DLPack layout and type-index checks against official headers;
-- GDN specialization-key completeness; and
-- tensor validation and output/workspace layout calculations.
-
-### GPU tests
-
-- build and load one artifact for every supported kernel family and architecture;
-- numerical comparison with the upstream FlashInfer Python APIs;
-- variable batch, sequence, state-pool indexing, and non-compact supported layouts;
-- optional argument combinations and expected validation failures;
-- concurrent first use from multiple threads and processes;
-- warm cache operation with Python unavailable;
-- CUDA Graph capture and repeated replay; and
-- module/cache lifetime behavior while graphs remain alive.
-
-The `decode-vertical` acceptance executable now covers the first-kernel subset of
-these gates on an NVIDIA GB10 (SM121a):
-
-- nonzero BF16-input/float-state direct decode against a Rust float reference;
-- in-place state comparison as well as BF16 output comparison;
-- indexed pools with distinct read and write slots;
-- global capture and repeated replay with graph-stable addresses;
-- replay after changing input contents at the same address; and
-- capture and replay on a second explicit CUDA stream; and
-- the same `forward` call for eager warmup/reference execution and capture, with
-  event tracking disabled as it is in `modeld-core`.
-
-Observed maximum errors for the deterministic `H=HV=1`, `K=V=128`, `B=2` case were
-`2.55e-5` for the compact-backend fallback's BF16 output, `2.8e-9` for its float
-state, `2.96e-5` for native-indexed output, and `2.9e-9` for the native-indexed
-destination state. These are implementation acceptance values, not promised public
-tolerances.
-
-The eager-only `nontranspose-decode` acceptance executable covers both upstream
-execution classes with distinct read/write indices into K-major state pools. On the
-same SM121a host, observed maximum errors were `1.48e-5` output and `2.8e-9` state
-for `B=2`, and `1.53e-5` output and `3.8e-9` state for `B=32`. CUDA Graph replay is
-intentionally left to the external graph owner and was not repeated for this second
-kernel.
-
-The eager-only `bf16-state-decode` acceptance executable covers both upstream
-BF16-state dispatch families with nonidentity indices into a larger V-major pool.
-On the same SM121a host, the `B=2`, `HV=1` ILP4 case observed zero output error and
-`7.45e-9` state error; the `B=512`, `HV=1` wide-vector case observed `1.91e-6`
-output error and `6.10e-5` state error. Expected values are quantized through BF16
-before comparison. CUDA Graph replay remains the responsibility of the external
-graph owner and was not duplicated for this kernel.
-
-The eager-only `bf16-state-mtp` acceptance executable covers checkpointed `T=2`
-execution in both upstream MTP dispatch families. It verifies that the input slots
-remain unchanged and that both post-token states land in their caller-selected
-slots. The `B=2`, `HV=1` ILP4 case observed zero output error and `3.05e-5` maximum
-pool error; the `B=128`, `HV=1` wide-vector case observed `3.05e-5` output error and
-`6.10e-5` pool error on SM121a. The reference keeps recurrent state in float32
-between tokens and quantizes each stored checkpoint through BF16. CUDA Graph replay
-remains owned by the external graph runtime.
-
-### ABI decision benchmark
-
-Benchmark eager TVM safe-call overhead and captured/replayed decode separately. The
-packed ABI should only be reconsidered for GDN if it produces a material end-to-end
-benefit after graph replay and its generated validation/packing burden is accounted
-for. The benchmark is an acceptance measurement, not a prerequisite for starting
-with the upstream TVM ABI.
-
-## Milestones
-
-1. **Workspace and contracts (complete)** — crate scaffolding, this plan, pinned
-   source metadata, first manifest schema, environment lock, and worker request.
-2. **Generic TVM artifact runtime (complete)** — canonical keys, interprocess cache,
-   subprocess timeout/logging, failure and corruption retention, AOT export/link,
-   atomic publication, manifest validation, and the TVM module loader are proven by
-   CPU tests and the GDN GPU smoke path.
-3. **Decode vertical slice (complete)** — pretransposed decode with a uniform
-   indexed-pool Candle API over native and compact-state backends, numerical tests,
-   external eager warmup, and CUDA Graph replay on multiple explicit streams.
-4. **Decode coverage (in progress)** — non-transposed float-state indexed-pool
-   decode is complete for small and large batches, and same-slot BF16-state T=1
-   decode plus checkpointed `T>=2` MTP are complete for ILP4 and wide-vector
-   dispatch. Split-pool and accepted-prefix fused-recovery variants remain.
-5. **Prefill coverage** — chunked prefill followed by context-parallel prefill.
-6. **Hardening** — supported version matrix, reproducible source distribution,
-   concurrent cache tests, diagnostics, examples, and benchmarks.
-7. **Reuse validation** — compile a representative MoonEP kernel through the same
-   artifact/cache pipeline and decide whether to implement `cute-packed` as a second
-   backend.
-
-## Open questions
-
-- What exact package versions form the first CUDA 12 lock, and which architectures
-  need it? The first CUDA 13 aarch64/Python 3.12 lock is established.
-- Can every remaining GDN module be isolated from Torch as safely as pretransposed
-  decode, especially modules that query `torch.cuda` at module scope?
-- What exact dynamic-layout classes should be shared between decode specializations
-  without causing unnecessary recompilation?
-- Which component owns persistent decode workspaces when Candle CUDA Graph helpers
-  also manage capture pools?
-- Do SM90, SM100, and SM120 require separate worker environments or can one pinned
-  CuTeDSL installation produce the full supported matrix?
+The next integration milestone is to wire the two Candle plans into the consumer's
+decode path, using its existing state allocator and CUDA Graph lifecycle. CUDA Graph
+replay verification and support for additional FlashInfer kernels are intentionally
+deferred until that integration is operational.

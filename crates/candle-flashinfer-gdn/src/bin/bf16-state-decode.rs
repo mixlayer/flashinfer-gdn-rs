@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use candle::cuda_backend::cudarc::driver::sys::CUdevice_attribute;
 use candle::{DType, Device, Tensor};
-use candle_flashinfer_gdn::{Bf16StateDecodeInputs, Bf16StateDecodePlan};
+use candle_flashinfer_gdn::{DecodeInputs, DecodePlan};
 use flashinfer_gdn::{
     Bf16StateDecodeCompiler, Bf16StateDecodeKernelVariant, Bf16StateDecodeSpecialization,
 };
@@ -81,7 +81,7 @@ fn run_case(
     }
     let compiler = Bf16StateDecodeCompiler::from_managed_python(python, cache_root)?
         .specialization(specialization)?;
-    let plan = Bf16StateDecodePlan::prepare(&compiler, &cuda_device, batch)?;
+    let plan = DecodePlan::prepare(&compiler, &cuda_device, batch)?;
 
     let pool_size = batch + 5;
     let pool_indices: Vec<usize> = (0..batch).map(|index| pool_size - 1 - index).collect();
@@ -108,7 +108,7 @@ fn run_case(
     let (beta, beta_quantized) = bf16_tensor(beta_values, (batch, 1, HV), device)?;
     let state_indices = Tensor::from_vec(device_indices, batch, device)?;
 
-    let output = plan.forward(&Bf16StateDecodeInputs {
+    let output = plan.forward(&DecodeInputs {
         state: &state,
         a_log: &a_log,
         a: &a,
@@ -118,6 +118,7 @@ fn run_case(
         v: &value,
         beta: &beta,
         state_indices: &state_indices,
+        checkpoint_indices: None,
     })?;
     device.synchronize()?;
 
@@ -131,7 +132,7 @@ fn run_case(
         &k_quantized,
         &v_quantized,
         &beta_quantized,
-        plan.specialization().scale,
+        plan.scale(),
         &pool_indices,
     );
     let expected_output = quantize_bf16(&expected_output)?;

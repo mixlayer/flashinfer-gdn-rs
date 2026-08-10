@@ -6,7 +6,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use candle::{DType, Device, Tensor};
-use candle_flashinfer_gdn::{Bf16StateMtpInputs, Bf16StateMtpPlan};
+use candle_flashinfer_gdn::{DecodeInputs, DecodePlan};
 use flashinfer_gdn::{Bf16StateMtpCompiler, Bf16StateMtpKernelVariant, Bf16StateMtpSpecialization};
 
 const H: usize = 1;
@@ -73,7 +73,7 @@ fn run_case(
     }
     let compiler = Bf16StateMtpCompiler::from_managed_python(python, cache_root)?
         .specialization(specialization)?;
-    let plan = Bf16StateMtpPlan::prepare(&compiler, &cuda_device, batch)?;
+    let plan = DecodePlan::prepare(&compiler, &cuda_device, batch)?;
 
     let pool_size = batch * (T + 1) + 5;
     let pool_indices: Vec<usize> = (0..batch).map(|index| batch - 1 - index).collect();
@@ -109,7 +109,7 @@ fn run_case(
     let checkpoint_indices_tensor =
         Tensor::from_vec(device_checkpoint_indices, (batch, T), device)?;
 
-    let output = plan.forward(&Bf16StateMtpInputs {
+    let output = plan.forward(&DecodeInputs {
         state: &state,
         a_log: &a_log,
         a: &a,
@@ -119,7 +119,7 @@ fn run_case(
         v: &value,
         beta: &beta,
         state_indices: &state_indices,
-        checkpoint_indices: &checkpoint_indices_tensor,
+        checkpoint_indices: Some(&checkpoint_indices_tensor),
     })?;
     device.synchronize()?;
 
@@ -133,7 +133,7 @@ fn run_case(
         &k_quantized,
         &v_quantized,
         &beta_quantized,
-        plan.specialization().scale,
+        plan.scale(),
         &pool_indices,
         &checkpoint_indices,
     );
