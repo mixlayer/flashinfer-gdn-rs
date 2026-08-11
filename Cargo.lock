@@ -210,6 +210,7 @@ dependencies = [
 name = "cutedsl-jit"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "libloading",
  "serde",
  "serde_json",

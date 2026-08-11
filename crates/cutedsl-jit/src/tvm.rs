@@ -68,13 +68,22 @@ impl TvmModule {
         for runtime in &artifact.manifest().runtime_libraries {
             // SAFETY: the artifact validator checked this exact library's content
             // digest. Handles remain alive until after the generated module drops.
-            let library = unsafe { Library::open(Some(&runtime.path), RTLD_NOW | RTLD_GLOBAL) }
-                .map_err(|error| {
-                    Error::DynamicLoad(format!(
-                        "failed to load runtime library {}: {error}",
-                        runtime.path.display()
-                    ))
-                })?;
+            // CuTeDSL and an embedding inference runtime can carry different
+            // patch releases of TVM-FFI in the same process. Deep binding keeps
+            // each runtime's static registry self-contained instead of binding
+            // its constructors to an older RTLD_GLOBAL registry.
+            let library = unsafe {
+                Library::open(
+                    Some(&runtime.path),
+                    RTLD_NOW | RTLD_GLOBAL | libc::RTLD_DEEPBIND,
+                )
+            }
+            .map_err(|error| {
+                Error::DynamicLoad(format!(
+                    "failed to load runtime library {}: {error}",
+                    runtime.path.display()
+                ))
+            })?;
             runtime_libraries.push(library);
         }
 
@@ -111,14 +120,18 @@ impl TvmModule {
         let module_path = artifact.file("module")?;
         // SAFETY: the module content and its runtime dependencies were validated
         // against the compiler-produced manifest.
-        let module = unsafe { Library::open(Some(&module_path), RTLD_NOW | RTLD_GLOBAL) }.map_err(
-            |error| {
-                Error::DynamicLoad(format!(
-                    "failed to load generated module {}: {error}",
-                    module_path.display()
-                ))
-            },
-        )?;
+        let module = unsafe {
+            Library::open(
+                Some(&module_path),
+                RTLD_NOW | RTLD_GLOBAL | libc::RTLD_DEEPBIND,
+            )
+        }
+        .map_err(|error| {
+            Error::DynamicLoad(format!(
+                "failed to load generated module {}: {error}",
+                module_path.display()
+            ))
+        })?;
         let entry_name =
             CString::new(artifact.manifest().entry_symbol.as_bytes()).map_err(|_| {
                 Error::InvalidManifest {
