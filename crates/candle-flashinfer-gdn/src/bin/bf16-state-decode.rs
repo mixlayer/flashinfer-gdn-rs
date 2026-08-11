@@ -67,13 +67,17 @@ fn run_case(
     let a_log = Tensor::from_vec(a_log_values.clone(), HV, device)?;
     let (a, a_quantized) = bf16_tensor(a_values, (batch, 1, HV), device)?;
     let dt_bias = Tensor::from_vec(dt_bias_values.clone(), HV, device)?;
-    let (q, q_quantized) = bf16_tensor(q_values, (batch, 1, H, K), device)?;
-    let (key, k_quantized) = bf16_tensor(k_values, (batch, 1, H, K), device)?;
-    // Exercise the model adapter's zero-byte-offset normalization with a
-    // contiguous subview, matching split QKV projections in real models.
-    let key = Tensor::cat(&[Tensor::zeros((1, 1, H, K), DType::BF16, device)?, key], 0)?
-        .narrow(0, 1, batch)?;
-    let (value, v_quantized) = bf16_tensor(v_values, (batch, 1, HV, V), device)?;
+    let (q_base, q_quantized) = bf16_tensor(q_values, (batch, H, K), device)?;
+    let (key_base, k_quantized) = bf16_tensor(k_values, (batch, H, K), device)?;
+    let (value_base, v_quantized) = bf16_tensor(v_values, (batch, HV, V), device)?;
+    // Exercise packed model projections directly: every logical Q/K/V row has
+    // a larger outer stride, and K/V also have aligned non-zero byte offsets.
+    let packed_qkv = Tensor::cat(&[&q_base, &key_base, &value_base], 1)?;
+    let q = packed_qkv.narrow(1, 0, H)?.reshape((batch, 1, H, K))?;
+    let key = packed_qkv.narrow(1, H, H)?.reshape((batch, 1, H, K))?;
+    let value = packed_qkv
+        .narrow(1, 2 * H, HV)?
+        .reshape((batch, 1, HV, V))?;
     let (beta, beta_quantized) = bf16_tensor(beta_values, (batch, 1, HV), device)?;
     let state_indices = Tensor::from_vec(device_indices, batch, device)?;
 
