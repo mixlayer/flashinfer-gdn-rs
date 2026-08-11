@@ -5,6 +5,7 @@ use std::error::Error;
 use std::io;
 use std::path::PathBuf;
 
+use candle::cuda_backend::cudarc::driver::sys::{CUgraphInstantiate_flags, CUstreamCaptureMode};
 use candle::{DType, Device, Tensor};
 use candle_flashinfer_gdn::{DecodeInputs, GdnDecode, GdnDecodeConfig, GdnHandle};
 
@@ -25,6 +26,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
 
     let device = Device::new_cuda_with_stream(0)?;
+    // SAFETY: this acceptance binary synchronizes the single owned stream before
+    // capture and before dropping any tensors used by the captured graph.
+    unsafe {
+        device.as_cuda_device()?.disable_event_tracking();
+    }
     let decode = GdnDecode::new(&handle, &device, GdnDecodeConfig::new(H, HV, K, V))?;
     let fallback = run_case(2, &decode, &device)?;
     let wide = run_case(512, &decode, &device)?;
@@ -108,6 +114,18 @@ fn run_case(
             "batch {batch} numerical mismatch: output={output_error:e}, state={state_error:e}"
         ))
         .into());
+    }
+    if batch == 2 {
+        let stream = device.as_cuda_device()?.cuda_stream();
+        stream.synchronize()?;
+        stream.begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL)?;
+        let captured_output = plan.forward(&inputs)?;
+        drop(captured_output);
+        let graph = stream
+            .end_capture(CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)?
+            .ok_or_else(|| io::Error::other("CUDA graph capture returned no graph"))?;
+        graph.launch()?;
+        stream.synchronize()?;
     }
     Ok((output_error, state_error))
 }
