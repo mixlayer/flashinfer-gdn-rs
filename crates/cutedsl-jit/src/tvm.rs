@@ -10,6 +10,31 @@ type ErrorMoveFromRaised = unsafe extern "C" fn(*mut *mut c_void);
 type ObjectDecRef = unsafe extern "C" fn(*mut c_void) -> i32;
 type GetVersion = unsafe extern "C" fn(*mut TvmFfiVersion);
 
+#[repr(C)]
+struct TvmFfiObject {
+    combined_ref_count: u64,
+    type_index: i32,
+    padding: u32,
+    deleter: *mut c_void,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TvmFfiByteArray {
+    data: *const u8,
+    size: usize,
+}
+
+#[repr(C)]
+struct TvmFfiErrorCell {
+    kind: TvmFfiByteArray,
+    message: TvmFfiByteArray,
+    backtrace: TvmFfiByteArray,
+    update_backtrace: *mut c_void,
+    cause_chain: *mut c_void,
+    extra_context: *mut c_void,
+}
+
 /// Version returned by TVMFFIGetVersion.
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -230,11 +255,40 @@ impl TvmModule {
         // SAFETY: a failed safe call stores its raised object in TVM thread-local
         // state and transfers ownership through TVMFFIErrorMoveFromRaised.
         unsafe { (self.error_move_from_raised)(&mut error) };
-        if !error.is_null() {
+        let message = if error.is_null() {
+            "TVM did not provide a raised error object".to_string()
+        } else {
+            // SAFETY: TVMFFIErrorMoveFromRaised returned an owned ffi.Error
+            // object. Its ErrorCell immediately follows the public object header
+            // and remains valid until TVMFFIObjectDecRef below.
+            let cell = unsafe {
+                &*error
+                    .cast::<u8>()
+                    .add(std::mem::size_of::<TvmFfiObject>())
+                    .cast::<TvmFfiErrorCell>()
+            };
+            let bytes = |value: TvmFfiByteArray| {
+                if value.data.is_null() || value.size == 0 {
+                    String::new()
+                } else {
+                    // SAFETY: each byte array is owned by the live error object.
+                    let value = unsafe { std::slice::from_raw_parts(value.data, value.size) };
+                    String::from_utf8_lossy(value).into_owned()
+                }
+            };
+            let kind = bytes(cell.kind);
+            let detail = bytes(cell.message);
             // SAFETY: ownership of the raised object was moved into error.
             let _ = unsafe { (self.object_dec_ref)(error) };
-        }
-        Err(Error::TvmCall { status })
+            if kind.is_empty() {
+                detail
+            } else if detail.is_empty() {
+                kind
+            } else {
+                format!("{kind}: {detail}")
+            }
+        };
+        Err(Error::TvmCall { status, message })
     }
 }
 

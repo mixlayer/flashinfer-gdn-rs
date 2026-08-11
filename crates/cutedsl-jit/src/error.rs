@@ -97,10 +97,12 @@ pub enum Error {
     },
 
     /// A TVM safe-call returned an error after its raised object was released.
-    #[error("TVM FFI safe-call failed with status {status}")]
+    #[error("TVM FFI safe-call failed with status {status}: {message}")]
     TvmCall {
         /// Safe-call status code.
         status: i32,
+        /// Error kind and message copied from the raised TVM error object.
+        message: String,
     },
 }
 
