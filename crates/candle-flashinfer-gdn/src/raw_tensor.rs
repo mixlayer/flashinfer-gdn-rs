@@ -28,11 +28,11 @@ impl RawTensor {
         name: &'static str,
     ) -> Result<Self> {
         Ok(Self {
-            address,
+            address: adjusted_address(address, dtype, layout, name)?,
             dtype: convert_dtype(dtype)?,
             shape: dimensions(layout.dims(), name)?,
             strides: dimensions(layout.stride(), name)?,
-            byte_offset: byte_offset(dtype, layout, name)?,
+            byte_offset: 0,
             device_id,
         })
     }
@@ -77,12 +77,13 @@ pub(crate) fn descriptor_parts(
     device_id: i32,
     name: &'static str,
 ) -> Result<CudaTensor> {
+    let address = adjusted_address(address, dtype, layout, name)?;
     // SAFETY: the surrounding launch retains the Candle storage lock and cudarc
     // access guard until after the kernel has been enqueued.
     unsafe {
         CudaTensor::from_raw_parts(
             address as *mut c_void,
-            byte_offset(dtype, layout, name)?,
+            0,
             device_id,
             convert_dtype(dtype)?,
             dimensions(layout.dims(), name)?,
@@ -205,4 +206,17 @@ fn byte_offset(dtype: CandleDType, layout: &Layout, name: &'static str) -> Resul
         .checked_mul(dtype.size_in_bytes())
         .ok_or_else(|| message(format!("{name} byte offset overflows usize")))?;
     u64::try_from(bytes).map_err(|_| message(format!("{name} byte offset does not fit u64")))
+}
+
+fn adjusted_address(
+    address: usize,
+    dtype: CandleDType,
+    layout: &Layout,
+    name: &'static str,
+) -> Result<usize> {
+    let offset = usize::try_from(byte_offset(dtype, layout, name)?)
+        .map_err(|_| message(format!("{name} byte offset does not fit usize")))?;
+    address
+        .checked_add(offset)
+        .ok_or_else(|| message(format!("{name} adjusted address overflows usize")))
 }

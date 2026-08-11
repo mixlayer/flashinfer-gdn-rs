@@ -63,6 +63,10 @@ fn run_case(
     let dt_bias = Tensor::from_vec(dt_bias_values.clone(), HV, device)?;
     let (q, q_quantized) = bf16_tensor(q_values, (batch, 1, H, K), device)?;
     let (key, k_quantized) = bf16_tensor(k_values, (batch, 1, H, K), device)?;
+    // Exercise the model adapter's zero-byte-offset normalization with a
+    // contiguous subview, matching split QKV projections in real models.
+    let key = Tensor::cat(&[Tensor::zeros((1, 1, H, K), DType::BF16, device)?, key], 0)?
+        .narrow(0, 1, batch)?;
     let (value, v_quantized) = bf16_tensor(v_values, (batch, 1, HV, V), device)?;
     let (beta, beta_quantized) = bf16_tensor(beta_values, (batch, 1, HV), device)?;
     let state_indices = Tensor::from_vec(device_indices, batch, device)?;
