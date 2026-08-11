@@ -277,6 +277,9 @@ pub struct DecodePlan {
 
 impl DecodePlan {
     /// Runs the prepared kernel and returns `[B,T,HV,V]` BF16 output.
+    ///
+    /// The returned tensor aliases plan-owned graph-stable storage. Calls on one
+    /// plan must be ordered on its CUDA stream and must not execute concurrently.
     pub fn forward(&self, inputs: &DecodeInputs<'_>) -> Result<Tensor> {
         validate_input_devices(inputs, self.device(), self.tokens())?;
         match &self.backend {

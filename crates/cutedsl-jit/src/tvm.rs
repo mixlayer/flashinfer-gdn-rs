@@ -4,11 +4,37 @@ use std::fmt;
 use libloading::os::unix::{Library, RTLD_GLOBAL, RTLD_NOW};
 
 use crate::tvm_ffi::{TvmFfiAny, TvmFfiSafeCall};
-use crate::{Abi, Artifact, Error, Result};
+use crate::{Abi, Artifact, Error, Result, RuntimeLibrary};
 
 type ErrorMoveFromRaised = unsafe extern "C" fn(*mut *mut c_void);
 type ObjectDecRef = unsafe extern "C" fn(*mut c_void) -> i32;
 type GetVersion = unsafe extern "C" fn(*mut TvmFfiVersion);
+
+const TVM_FFI_ERROR_TYPE_INDEX: i32 = 67;
+
+#[repr(C)]
+struct TvmFfiObject {
+    combined_ref_count: u64,
+    type_index: i32,
+    padding: u32,
+    deleter: *mut c_void,
+}
+
+#[repr(C)]
+struct TvmFfiByteArray {
+    data: *const u8,
+    size: usize,
+}
+
+#[repr(C)]
+struct TvmFfiErrorCell {
+    kind: TvmFfiByteArray,
+    message: TvmFfiByteArray,
+    backtrace: TvmFfiByteArray,
+    update_backtrace: *mut c_void,
+    cause_chain: *mut c_void,
+    extra_context: *mut c_void,
+}
 
 /// Version returned by TVMFFIGetVersion.
 #[repr(C)]
@@ -64,20 +90,10 @@ impl TvmModule {
             });
         }
 
-        let mut runtime_libraries = Vec::with_capacity(artifact.manifest().runtime_libraries.len());
-        for runtime in &artifact.manifest().runtime_libraries {
-            // SAFETY: the artifact validator checked this exact library's content
-            // digest. Handles remain alive until after the generated module drops.
-            let library = unsafe { Library::open(Some(&runtime.path), RTLD_NOW | RTLD_GLOBAL) }
-                .map_err(|error| {
-                    Error::DynamicLoad(format!(
-                        "failed to load runtime library {}: {error}",
-                        runtime.path.display()
-                    ))
-                })?;
-            runtime_libraries.push(library);
-        }
-
+        let runtime_libraries = load_runtime_libraries(
+            &artifact.manifest().runtime_libraries,
+            artifact.manifest().tvm_ffi_runtime_version.as_deref(),
+        )?;
         let error_move_from_raised = find_symbol(
             &runtime_libraries,
             b"TVMFFIErrorMoveFromRaised\0",
@@ -97,7 +113,6 @@ impl TvmModule {
         // SAFETY: the function was resolved from a digest-validated TVM runtime
         // using the official TVMFFIGetVersion C signature.
         unsafe { get_version(&mut version) };
-
         if let Some(expected) = &artifact.manifest().tvm_ffi_runtime_version {
             let actual = version.to_string();
             if *expected != actual {
@@ -217,12 +232,114 @@ impl TvmModule {
         // SAFETY: a failed safe call stores its raised object in TVM thread-local
         // state and transfers ownership through TVMFFIErrorMoveFromRaised.
         unsafe { (self.error_move_from_raised)(&mut error) };
+        let (kind, message) = if error.is_null() {
+            (
+                "UnknownError".into(),
+                "TVM did not provide an error object".into(),
+            )
+        } else {
+            // SAFETY: TVM transferred one owned error object to this function.
+            unsafe { error_details(error) }
+        };
         if !error.is_null() {
             // SAFETY: ownership of the raised object was moved into error.
             let _ = unsafe { (self.object_dec_ref)(error) };
         }
-        Err(Error::TvmCall { status })
+        Err(Error::TvmCall {
+            status,
+            kind,
+            message,
+        })
     }
+}
+
+unsafe fn error_details(error: *mut c_void) -> (String, String) {
+    // SAFETY: caller guarantees error points to a live TVM FFI object header.
+    let object = unsafe { &*error.cast::<TvmFfiObject>() };
+    if object.type_index != TVM_FFI_ERROR_TYPE_INDEX {
+        return (
+            "UnknownError".into(),
+            format!("TVM raised object type index {}", object.type_index),
+        );
+    }
+    // TVMFFIErrorCell immediately follows the common TVMFFIObject header.
+    // SAFETY: the checked static type index guarantees this object layout.
+    let cell = unsafe {
+        &*error
+            .cast::<u8>()
+            .add(std::mem::size_of::<TvmFfiObject>())
+            .cast::<TvmFfiErrorCell>()
+    };
+    // SAFETY: TVM owns both byte arrays until the error object is released.
+    let kind = unsafe { byte_array_to_string(&cell.kind) };
+    // SAFETY: same lifetime guarantee as kind.
+    let message = unsafe { byte_array_to_string(&cell.message) };
+    (kind, message)
+}
+
+unsafe fn byte_array_to_string(bytes: &TvmFfiByteArray) -> String {
+    if bytes.data.is_null() || bytes.size == 0 {
+        return String::new();
+    }
+    // SAFETY: caller guarantees TVM owns a readable byte array of this length.
+    String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(bytes.data, bytes.size) })
+        .into_owned()
+}
+
+fn load_runtime_libraries(
+    runtimes: &[RuntimeLibrary],
+    expected_version: Option<&str>,
+) -> Result<Vec<Library>> {
+    if runtimes.is_empty() {
+        return Err(Error::DynamicLoad(
+            "TVM artifact declares no runtime libraries".into(),
+        ));
+    }
+    // Reuse an already-global TVM runtime only when it exactly matches the
+    // compiler artifact. This turns an otherwise fatal duplicate-registry C++
+    // initializer into a normal version error when runtimes are loaded in the
+    // wrong order.
+    let process = Library::this();
+    let existing_version = unsafe { process.get::<GetVersion>(b"TVMFFIGetVersion\0") }
+        .ok()
+        .map(|get_version| {
+            let mut version = TvmFfiVersion::default();
+            // SAFETY: the symbol has the official TVMFFIGetVersion signature.
+            unsafe { get_version(&mut version) };
+            version
+        });
+    if let (Some(expected), Some(actual)) = (expected_version, existing_version)
+        && expected != actual.to_string()
+    {
+        return Err(Error::TvmVersionMismatch {
+            expected: expected.to_owned(),
+            actual: actual.to_string(),
+        });
+    }
+
+    let mut libraries = Vec::with_capacity(runtimes.len() + 1);
+    for runtime in runtimes {
+        if existing_version.is_some()
+            && runtime.path.file_name().and_then(|name| name.to_str()) == Some("libtvm_ffi.so")
+        {
+            continue;
+        }
+        // SAFETY: the artifact validator checked this exact library's content
+        // digest. Handles remain alive until after every generated module drops.
+        let library = unsafe { Library::open(Some(&runtime.path), RTLD_NOW | RTLD_GLOBAL) }
+            .map_err(|error| {
+                Error::DynamicLoad(format!(
+                    "failed to load runtime library {}: {error}",
+                    runtime.path.display()
+                ))
+            })?;
+        libraries.push(library);
+    }
+    if existing_version.is_some() {
+        libraries.push(process);
+    }
+
+    Ok(libraries)
 }
 
 fn find_symbol<T: Copy>(libraries: &[Library], symbol: &[u8], display_name: &str) -> Result<T> {

@@ -42,6 +42,15 @@ pub(crate) fn expect(
             ),
         ));
     }
+    if tensor.byte_offset() != 0 {
+        return Err(Error::tensor(
+            name,
+            format!(
+                "generated GDN entrypoints require byte_offset=0, found {}",
+                tensor.byte_offset()
+            ),
+        ));
+    }
     if tensor.strides().last() != Some(&1) {
         return Err(Error::tensor(
             name,

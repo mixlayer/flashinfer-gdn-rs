@@ -22,6 +22,7 @@ pub(super) struct Plan {
     batch: usize,
     accepted_steps: Tensor,
     ssm_state_indices: Tensor,
+    output: Tensor,
 }
 
 impl Plan {
@@ -33,12 +34,19 @@ impl Plan {
         let candle_device = Device::Cuda(device.clone());
         let accepted_steps = Tensor::zeros(batch, CandleDType::I32, &candle_device)?;
         let ssm_state_indices = Tensor::zeros((batch, 1), CandleDType::I32, &candle_device)?;
+        let spec = core.specialization();
+        let output = Tensor::zeros(
+            (batch, 1, spec.hv, spec.v),
+            CandleDType::BF16,
+            &candle_device,
+        )?;
         Ok(Self {
             core,
             device: device.clone(),
             batch,
             accepted_steps,
             ssm_state_indices,
+            output,
         })
     }
 
@@ -60,16 +68,7 @@ impl Plan {
         &self.device
     }
 
-    fn empty_output(&self) -> Result<Tensor> {
-        let spec = self.specialization();
-        Tensor::zeros(
-            (self.batch, 1, spec.hv, spec.v),
-            CandleDType::BF16,
-            &Device::Cuda(self.device.clone()),
-        )
-    }
-
-    /// Runs BF16-state GDN decode and returns the BF16 output.
+    /// Runs BF16-state GDN decode into plan-owned graph-stable output storage.
     pub fn forward(&self, inputs: &DecodeInputs<'_>) -> Result<Tensor> {
         let spec = self.specialization();
         validate_indexed_state_pool(
@@ -79,14 +78,13 @@ impl Plan {
             &[spec.hv, spec.v, spec.k],
             self.batch,
         )?;
-        let output = self.empty_output()?;
-        self.validate_mutable_aliases(inputs, &output)?;
+        self.validate_mutable_aliases(inputs, &self.output)?;
         inputs.state.inplace_op1(&StateLaunch {
             plan: self,
             inputs,
-            output: &output,
+            output: &self.output,
         })?;
-        Ok(output)
+        Ok(self.output.clone())
     }
 
     fn validate_mutable_aliases(&self, inputs: &DecodeInputs<'_>, output: &Tensor) -> Result<()> {
