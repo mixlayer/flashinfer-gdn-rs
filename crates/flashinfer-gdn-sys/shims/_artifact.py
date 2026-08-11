@@ -12,6 +12,9 @@ import subprocess
 import sys
 from typing import Any
 
+_TVM_RUNTIME_SONAME = b"libtvm_ffi.so"
+_PRIVATE_TVM_RUNTIME_SONAME = b"libgdn_tvm.so"
+
 
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
@@ -33,7 +36,7 @@ def _tvm_ffi_runtime_version(runtime_libraries: list[str]) -> str:
     path = next(
         Path(path).resolve()
         for path in runtime_libraries
-        if Path(path).name == "libtvm_ffi.so"
+        if Path(path).name in {"libtvm_ffi.so", "libgdn_tvm.so"}
     )
     library = ctypes.CDLL(str(path))
     get_version = library.TVMFFIGetVersion
@@ -42,6 +45,28 @@ def _tvm_ffi_runtime_version(runtime_libraries: list[str]) -> str:
     version = _TvmFfiVersion()
     get_version(ctypes.byref(version))
     return f"{version.major}.{version.minor}.{version.patch}"
+
+
+def _isolate_tvm_runtime(runtime_libraries: list[str]) -> list[str]:
+    """Copy TVM with a private SONAME so embedders can carry another TVM ABI."""
+    isolated: list[str] = []
+    for value in runtime_libraries:
+        path = Path(value).resolve()
+        if path.name != _TVM_RUNTIME_SONAME.decode():
+            isolated.append(str(path))
+            continue
+        content = path.read_bytes()
+        replacements = content.count(_TVM_RUNTIME_SONAME)
+        if replacements == 0:
+            raise RuntimeError(f"TVM runtime has no SONAME to isolate: {path}")
+        private_path = path.with_name(_PRIVATE_TVM_RUNTIME_SONAME.decode())
+        temporary = private_path.with_name(f".{private_path.name}.{os.getpid()}.tmp")
+        temporary.write_bytes(
+            content.replace(_TVM_RUNTIME_SONAME, _PRIVATE_TVM_RUNTIME_SONAME)
+        )
+        os.replace(temporary, private_path)
+        isolated.append(str(private_path))
+    return isolated
 
 
 def _compiler_environment() -> dict[str, Any]:
@@ -81,6 +106,8 @@ def finalize_artifact(
     """Link one exported object, verify its symbol, and publish its manifest."""
     module_path = output_dir / "module.so"
     manifest_path = output_dir / "manifest.json"
+    tvm_ffi_runtime_version = _tvm_ffi_runtime_version(runtime_libraries)
+    runtime_libraries = _isolate_tvm_runtime(runtime_libraries)
     link_command = [cc, "-shared", "-o", str(module_path), str(object_path)]
     link_command.extend(str(Path(path).resolve()) for path in runtime_libraries)
     link_command.append("-Wl,-z,defs")
@@ -124,7 +151,7 @@ def finalize_artifact(
             "nvidia-cutlass-dsl": importlib.metadata.version("nvidia-cutlass-dsl"),
         },
         "compiler_environment": _compiler_environment(),
-        "tvm_ffi_runtime_version": _tvm_ffi_runtime_version(runtime_libraries),
+        "tvm_ffi_runtime_version": tvm_ffi_runtime_version,
         "torch_required": torch_required,
         "request": request,
         "artifacts": {

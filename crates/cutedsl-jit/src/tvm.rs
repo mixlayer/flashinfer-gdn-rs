@@ -93,10 +93,8 @@ impl TvmModule {
         for runtime in &artifact.manifest().runtime_libraries {
             // SAFETY: the artifact validator checked this exact library's content
             // digest. Handles remain alive until after the generated module drops.
-            // CuTeDSL and an embedding inference runtime can carry different
-            // patch releases of TVM-FFI in the same process. Deep binding keeps
-            // each runtime's static registry self-contained instead of binding
-            // its constructors to an older RTLD_GLOBAL registry.
+            // CuTeDSL's TVM runtime has a private SONAME in compiler-produced
+            // artifacts; deep binding keeps its internal registry self-contained.
             let library = unsafe {
                 Library::open(
                     Some(&runtime.path),
