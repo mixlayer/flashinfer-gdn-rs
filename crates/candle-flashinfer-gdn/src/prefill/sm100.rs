@@ -19,21 +19,28 @@ pub(super) struct Plan {
     device: CudaDevice,
     shape: PrefillShape,
     tensormaps: Tensor,
+    output: Tensor,
 }
 
 impl Plan {
     pub(super) fn new(core: CorePlan, device: &CudaDevice, shape: PrefillShape) -> Result<Self> {
-        let workspace_size = core
-            .specialization()
+        let spec = core.specialization();
+        let workspace_size = spec
             .num_sms
             .checked_mul(4 * 128)
             .ok_or_else(|| message("SM100 prefill workspace size overflows usize"))?;
         let tensormaps = Tensor::zeros(workspace_size, DType::U8, &Device::Cuda(device.clone()))?;
+        let output = Tensor::zeros(
+            (shape.total_tokens, spec.hv, spec.v),
+            DType::BF16,
+            &Device::Cuda(device.clone()),
+        )?;
         Ok(Self {
             core,
             device: device.clone(),
             shape,
             tensormaps,
+            output,
         })
     }
 
@@ -55,18 +62,13 @@ impl Plan {
             self.shape.batch,
         )?;
         validate_checkpoint_inputs(inputs, spec, self.shape.batch, self.shape.checkpoint_count)?;
-        let output = Tensor::zeros(
-            (self.shape.total_tokens, spec.hv, spec.v),
-            DType::BF16,
-            &Device::Cuda(self.device.clone()),
-        )?;
-        self.validate_aliases(inputs, &output)?;
+        self.validate_aliases(inputs, &self.output)?;
         inputs.state.inplace_op1(&StateLaunch {
             plan: self,
             inputs,
-            output: &output,
+            output: &self.output,
         })?;
-        Ok(output)
+        Ok(self.output.clone())
     }
 
     fn validate_aliases(&self, inputs: &PrefillInputs<'_>, output: &Tensor) -> Result<()> {

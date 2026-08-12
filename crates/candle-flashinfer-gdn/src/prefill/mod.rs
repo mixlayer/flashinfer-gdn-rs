@@ -318,6 +318,9 @@ pub struct PrefillPlan {
 
 impl PrefillPlan {
     /// Runs prefill, updates selected pool slots, and returns `[N,HV,V]` BF16.
+    ///
+    /// The returned tensor aliases plan-owned graph-stable storage. Calls on one
+    /// plan must be ordered on its CUDA stream and must not execute concurrently.
     pub fn forward(&self, inputs: &PrefillInputs<'_>) -> Result<Tensor> {
         validate_input_devices(inputs, self.device())?;
         match &self.backend {

@@ -21,6 +21,7 @@ pub(super) struct Plan {
     device: CudaDevice,
     batch: usize,
     accepted_steps: Tensor,
+    output: Tensor,
 }
 
 impl Plan {
@@ -31,11 +32,18 @@ impl Plan {
         }
         let candle_device = Device::Cuda(device.clone());
         let accepted_steps = Tensor::zeros(batch, CandleDType::I32, &candle_device)?;
+        let spec = core.specialization();
+        let output = Tensor::zeros(
+            (batch, spec.t, spec.hv, spec.v),
+            CandleDType::BF16,
+            &candle_device,
+        )?;
         Ok(Self {
             core,
             device: device.clone(),
             batch,
             accepted_steps,
+            output,
         })
     }
 
@@ -57,16 +65,7 @@ impl Plan {
         &self.device
     }
 
-    fn empty_output(&self) -> Result<Tensor> {
-        let spec = self.specialization();
-        Tensor::zeros(
-            (self.batch, spec.t, spec.hv, spec.v),
-            CandleDType::BF16,
-            &Device::Cuda(self.device.clone()),
-        )
-    }
-
-    /// Runs BF16-state MTP and returns `[B,T,HV,V]` BF16 output.
+    /// Runs BF16-state MTP into plan-owned graph-stable `[B,T,HV,V]` output.
     pub fn forward(
         &self,
         inputs: &DecodeInputs<'_>,
@@ -80,15 +79,14 @@ impl Plan {
             &[spec.hv, spec.v, spec.k],
             self.batch,
         )?;
-        let output = self.empty_output()?;
-        self.validate_mutable_aliases(inputs, checkpoint_indices, &output)?;
+        self.validate_mutable_aliases(inputs, checkpoint_indices, &self.output)?;
         inputs.state.inplace_op1(&StateLaunch {
             plan: self,
             inputs,
             checkpoint_indices,
-            output: &output,
+            output: &self.output,
         })?;
-        Ok(output)
+        Ok(self.output.clone())
     }
 
     fn validate_mutable_aliases(

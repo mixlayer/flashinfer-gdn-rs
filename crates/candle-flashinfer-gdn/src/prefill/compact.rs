@@ -56,6 +56,7 @@ pub(super) struct Plan {
     shape: PrefillShape,
     adapter: StateAdapter,
     tensormaps: Tensor,
+    output: Tensor,
 }
 
 impl Plan {
@@ -90,12 +91,18 @@ impl Plan {
             .checked_mul(128)
             .ok_or_else(|| message("compact prefill workspace size overflows usize"))?;
         let tensormaps = Tensor::zeros(workspace_size, DType::U8, &Device::Cuda(device.clone()))?;
+        let output = Tensor::zeros(
+            (shape.total_tokens, spec.hv, spec.v),
+            DType::BF16,
+            &Device::Cuda(device.clone()),
+        )?;
         Ok(Self {
             core,
             device: device.clone(),
             shape,
             adapter,
             tensormaps,
+            output,
         })
     }
 
@@ -128,18 +135,13 @@ impl Plan {
                 inputs.cu_seqlens.dims()
             )));
         }
-        let output = Tensor::zeros(
-            (self.shape.total_tokens, spec.hv, spec.v),
-            DType::BF16,
-            &Device::Cuda(self.device.clone()),
-        )?;
-        self.validate_aliases(inputs, &output)?;
+        self.validate_aliases(inputs, &self.output)?;
         inputs.state.inplace_op1(&PoolLaunch {
             plan: self,
             inputs,
-            output: &output,
+            output: &self.output,
         })?;
-        Ok(output)
+        Ok(self.output.clone())
     }
 
     fn validate_aliases(&self, inputs: &PrefillInputs<'_>, output: &Tensor) -> Result<()> {
