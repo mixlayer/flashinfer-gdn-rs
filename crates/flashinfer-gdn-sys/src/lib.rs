@@ -121,7 +121,7 @@ fn python_environment() -> Result<&'static PythonEnvironment> {
         return Ok(environment);
     }
     let lock =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("shims/requirements/cu13-aarch64-py312.lock");
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("shims/requirements/cu13-linux-py312.lock");
     let prepared = prepare_python_environment(lock)?;
     let _ = PYTHON_ENVIRONMENT.set(prepared);
     Ok(PYTHON_ENVIRONMENT

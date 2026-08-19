@@ -375,7 +375,7 @@ fn compiler_paths() -> CompilerPaths {
     CompilerPaths {
         shim: shims.join("compile_prefill.py"),
         support: shims.join("_artifact.py"),
-        requirements_lock: shims.join("requirements/cu13-aarch64-py312.lock"),
+        requirements_lock: shims.join("requirements/cu13-linux-py312.lock"),
     }
 }
 

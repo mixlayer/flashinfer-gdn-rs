@@ -41,7 +41,7 @@ normalized; the pinned prefill implementations do not fuse normalization.
 
 ## Requirements
 
-The checked-in compiler lock currently targets Linux aarch64, Python 3.12, and
+The checked-in compiler lock targets Linux aarch64 and x86_64, Python 3.12, and
 CUDA 13. A host C compiler is required to link generated modules. The decode
 kernels target compute capability 9.0 or newer. Prefill dispatches
 explicitly among SM90, SM100/SM103, and SM120/SM121.
@@ -88,7 +88,7 @@ An environment can also be provisioned explicitly:
 
 ```shell
 python3 crates/cutedsl-jit/python/prepare_environment.py \
-  --lock crates/flashinfer-gdn-sys/shims/requirements/cu13-aarch64-py312.lock
+  --lock crates/flashinfer-gdn-sys/shims/requirements/cu13-linux-py312.lock
 ```
 
 ## Candle lifecycle
