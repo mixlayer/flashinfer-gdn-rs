@@ -1,5 +1,5 @@
 use std::ffi::c_void;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use cutedsl_jit::{Abi, Artifact, CacheKey, CompilerCommand, Error, Result, TvmFfiAny, TvmModule};
@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{
-    DlTensor, GdnHandle, InputDType, host_compiler_identity, valid_gpu_architecture, write_json,
+    DlTensor, GdnHandle, InputDType, host_compiler_identity, runtime_asset_root,
+    valid_gpu_architecture, write_json,
 };
 
 /// Architecture-specific non-context-parallel GDN prefill implementation.
@@ -371,11 +372,11 @@ struct CompilerPaths {
 }
 
 fn compiler_paths() -> CompilerPaths {
-    let shims = Path::new(env!("CARGO_MANIFEST_DIR")).join("shims");
+    let shims = runtime_asset_root().join("shims");
     CompilerPaths {
         shim: shims.join("compile_prefill.py"),
         support: shims.join("_artifact.py"),
-        requirements_lock: shims.join("requirements/cu13-aarch64-py312.lock"),
+        requirements_lock: shims.join("requirements/cu13-linux-py312.lock"),
     }
 }
 

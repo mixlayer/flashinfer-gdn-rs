@@ -1,0 +1,5 @@
+# Generate the Linux aarch64/x86_64 hashed lock with:
+# uv pip compile --universal --generate-hashes --only-binary=:all: \
+#   --python-version 3.12 -o cu13-linux-py312.lock cu13-linux-py312.in
+apache-tvm-ffi==0.1.13.post2
+nvidia-cutlass-dsl[cu13]==4.7.0

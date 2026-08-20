@@ -6,11 +6,11 @@ the venv atomically, and validates pre-provisioned interpreters without mutating
 them. Rust library adapters can call `prepare_python_environment`; a library may
 cache its returned environment process-wide.
 
-For the initial aarch64/CUDA 13 toolchain:
+For the Linux aarch64 or x86_64 CUDA 13 toolchain:
 
 ```bash
 python3 crates/cutedsl-jit/python/prepare_environment.py \
-  --lock crates/flashinfer-gdn-sys/shims/requirements/cu13-aarch64-py312.lock
+  --lock crates/flashinfer-gdn-sys/shims/requirements/cu13-linux-py312.lock
 ```
 
 Set `CUTEDSL_JIT_PYTHON` to bypass managed installation. Use `--offline` with

@@ -13,5 +13,6 @@ packages include its actual source files, not the submodule's Git metadata, so a
 dependent's Cargo checkout is sufficient at runtime. The worker must not clone
 FlashInfer or install `flashinfer-python` with pip.
 
-`FLASHINFER_ROOT` remains available as an explicit development and relocated-binary
-override.
+`FLASHINFER_ROOT` remains available as an explicit build-time development override.
+Relocated binaries use `FLASHINFER_GDN_RUNTIME_ROOT` to find both this source tree
+and the compiler shims.

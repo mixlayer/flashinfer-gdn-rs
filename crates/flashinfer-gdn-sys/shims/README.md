@@ -34,18 +34,18 @@ Context-parallel dispatch is not included.
 uses the common CuTeDSL cache root for artifacts. Resolution is
 `CUTEDSL_JIT_CACHE_DIR`, then `$XDG_CACHE_HOME/cutedsl-jit`, then
 `$HOME/.cache/cutedsl-jit`. On the first call it runs the embedded preparation
-helper against the locked Linux aarch64/Python 3.12/CUDA 13 requirements. The
-helper validates an existing immutable environment or installs and atomically
-publishes it under that cache. Neither a Python path nor a cache path is required
-by the public Rust API. `GdnHandle::with_cache_root` remains available when only
-the artifact cache needs an explicit location.
+helper against the locked Linux aarch64 or x86_64/Python 3.12/CUDA 13
+requirements. The helper validates an existing immutable environment or installs
+and atomically publishes it under that cache. Neither a Python path nor a cache
+path is required by the public Rust API. `GdnHandle::with_cache_root` remains
+available when only the artifact cache needs an explicit location.
 
 For production image provisioning, the same environment can still be prepared
 ahead of time from the workspace root:
 
 ```shell
 python3 crates/cutedsl-jit/python/prepare_environment.py \
-  --lock crates/flashinfer-gdn-sys/shims/requirements/cu13-aarch64-py312.lock
+  --lock crates/flashinfer-gdn-sys/shims/requirements/cu13-linux-py312.lock
 ```
 
 `CUTEDSL_JIT_PYTHON` selects a pre-provisioned interpreter and validates it without

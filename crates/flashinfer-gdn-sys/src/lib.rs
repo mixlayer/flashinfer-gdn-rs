@@ -5,6 +5,7 @@
 //! GDN-specific argument schemas and `cutedsl-jit` modules. It intentionally does
 //! not depend on Candle.
 
+use std::ffi::OsString;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -44,10 +45,33 @@ pub const FLASHINFER_VERSION: &str = env!("FLASHINFER_GDN_VERSION");
 /// Git revision corresponding to [`FLASHINFER_VERSION`].
 pub const FLASHINFER_GIT_REV: &str = env!("FLASHINFER_GDN_GIT_REV");
 
-/// Returns the FlashInfer source tree selected by this crate's build script.
+const RUNTIME_ROOT_ENV: &str = "FLASHINFER_GDN_RUNTIME_ROOT";
+static FLASHINFER_SOURCE_ROOT: OnceLock<PathBuf> = OnceLock::new();
+
+/// Returns the directory containing the GDN compiler shims and vendored source.
+pub(crate) fn runtime_asset_root() -> PathBuf {
+    selected_runtime_asset_root(std::env::var_os(RUNTIME_ROOT_ENV))
+}
+
+fn selected_runtime_asset_root(runtime_root: Option<OsString>) -> PathBuf {
+    runtime_root
+        .filter(|root| !root.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+}
+
+/// Returns the packaged or build-selected FlashInfer source tree.
 #[must_use]
 pub fn source_root() -> &'static Path {
-    Path::new(env!("FLASHINFER_GDN_SOURCE_ROOT"))
+    FLASHINFER_SOURCE_ROOT
+        .get_or_init(|| {
+            std::env::var_os(RUNTIME_ROOT_ENV)
+                .filter(|root| !root.is_empty())
+                .map(PathBuf::from)
+                .map(|root| root.join("vendor/flashinfer"))
+                .unwrap_or_else(|| PathBuf::from(env!("FLASHINFER_GDN_SOURCE_ROOT")))
+        })
+        .as_path()
 }
 
 /// Shared compiler and artifact-cache context for all GDN kernel families.
@@ -120,8 +144,7 @@ fn python_environment() -> Result<&'static PythonEnvironment> {
     if let Some(environment) = PYTHON_ENVIRONMENT.get() {
         return Ok(environment);
     }
-    let lock =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("shims/requirements/cu13-aarch64-py312.lock");
+    let lock = runtime_asset_root().join("shims/requirements/cu13-linux-py312.lock");
     let prepared = prepare_python_environment(lock)?;
     let _ = PYTHON_ENVIRONMENT.set(prepared);
     Ok(PYTHON_ENVIRONMENT
@@ -208,6 +231,14 @@ fn host_compiler_identity() -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_asset_root_prefers_explicit_path() {
+        assert_eq!(
+            selected_runtime_asset_root(Some("/opt/flashinfer-gdn".into())),
+            PathBuf::from("/opt/flashinfer-gdn")
+        );
+    }
 
     #[test]
     fn selected_source_contains_bf16_decode() {

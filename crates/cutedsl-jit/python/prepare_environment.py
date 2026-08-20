@@ -185,6 +185,21 @@ def _publish_marker(
         stream.write("\n")
 
 
+def _validate_managed_environment_platform(
+    system: str, machine: str, python_version: tuple[int, int]
+) -> None:
+    if (
+        system != "linux"
+        or machine not in {"aarch64", "x86_64"}
+        or python_version != (3, 12)
+    ):
+        raise RuntimeError(
+            "unsupported managed CuTeDSL environment: the checked-in lock supports "
+            "CPython 3.12 on Linux aarch64 or x86_64; provide CUTEDSL_JIT_PYTHON "
+            "or add a lock for this platform"
+        )
+
+
 def main() -> None:
     args = _parse_args()
     lock = args.lock.resolve(strict=True)
@@ -209,11 +224,9 @@ def main() -> None:
         )
         return
 
-    if sys.version_info[:2] != (3, 12) or platform.machine() != "aarch64":
-        raise RuntimeError(
-            "this initial lock supports CPython 3.12 on aarch64 only; "
-            "provide CUTEDSL_JIT_PYTHON or add a lock for this platform"
-        )
+    _validate_managed_environment_platform(
+        sys.platform, platform.machine(), sys.version_info[:2]
+    )
 
     base_python = args.base_python.resolve(strict=True)
     cache_root = (args.cache_root or _default_cache_root()).expanduser().resolve()

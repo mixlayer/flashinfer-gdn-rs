@@ -232,7 +232,7 @@ Production images may provision the same environment ahead of time:
 
 ```shell
 python3 crates/cutedsl-jit/python/prepare_environment.py \
-  --lock crates/flashinfer-gdn-sys/shims/requirements/cu13-aarch64-py312.lock
+  --lock crates/flashinfer-gdn-sys/shims/requirements/cu13-linux-py312.lock
 ```
 
 The lock is binary-only, fully hashed, and does not install FlashInfer or PyTorch.
