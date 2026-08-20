@@ -1,5 +1,5 @@
 use std::ffi::c_void;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use cutedsl_jit::{Abi, Artifact, CacheKey, CompilerCommand, Error, Result, TvmFfiAny, TvmModule};
@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{
-    DlTensor, DtBiasDType, GdnHandle, InputDType, host_compiler_identity, valid_gpu_architecture,
-    write_json,
+    DlTensor, DtBiasDType, GdnHandle, InputDType, host_compiler_identity, runtime_asset_root,
+    valid_gpu_architecture, write_json,
 };
 
 /// Device implementation selected by FlashInfer's BF16-state T=1 dispatcher.
@@ -332,8 +332,7 @@ struct CompilerPaths {
 }
 
 fn compiler_paths() -> CompilerPaths {
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let shims = manifest.join("shims");
+    let shims = runtime_asset_root().join("shims");
     CompilerPaths {
         shim: shims.join("compile_bf16_state_decode.py"),
         support: shims.join("_artifact.py"),

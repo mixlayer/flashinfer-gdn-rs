@@ -78,6 +78,8 @@ The default cache root is selected in this order:
 
 Additional controls are available:
 
+- `FLASHINFER_GDN_RUNTIME_ROOT` selects a packaged runtime asset directory
+  containing `shims/` and `vendor/flashinfer/`.
 - `CUTEDSL_JIT_PYTHON` selects a pre-provisioned compatible interpreter.
 - `CUTEDSL_JIT_BASE_PYTHON` selects the interpreter used to create a managed
   environment and defaults to `python3`.
